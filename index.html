@@ -647,11 +647,19 @@ const WGSL_KELP = WGSL_COMMON + `
   // green -> gold; the grain term is only resolved close up, cheap hash beyond, and
   // the two cross-fade so no ring sweeps through the forest as the camera moves
   var grain = h31(floor(wp * 1.6) + vec3<f32>(seed * 11.0));
-  if (dist < 66.0) { grain = mix(grain, fbm3(wp * vec3<f32>(0.9, 0.32, 0.9), 2), sstep(66.0, 38.0, dist)); }
+  if (dist < 66.0) { grain = mix(grain, fbm3(wp * vec3<f32>(1.35, 0.48, 1.35), 3), sstep(66.0, 38.0, dist)); }
   var alb = mix(vec3<f32>(0.032, 0.088, 0.040), vec3<f32>(0.180, 0.265, 0.058), tint);
   alb = mix(alb, vec3<f32>(0.400, 0.305, 0.062), tint * tint * 0.85);
   alb *= 0.50 + 0.74 * grain;
   alb *= 0.40 + 0.78 * v;                          // tips catch more light
+  // Blade anatomy, so a frond is not a flat card: uv.x runs 0 -> 1 from one margin to the
+  // other, so 1-|2u-1| is the distance from the edge - a pale midrib with thinner, darker
+  // sides. And the canopy above is gold-olive while the understory stays deep green,
+  // because light really does fall off like that through 60 m of water.
+  let mid = 1.0 - abs(2.0 * in.uv.x - 1.0);
+  alb *= 0.84 + 0.24 * mid;
+  let canopy = sstep(u.camBasis.z - 56.0, u.camBasis.z - 16.0, wp.y);
+  alb = mix(alb, alb * vec3<f32>(1.14, 1.02, 0.62), canopy * 0.55);
   // Rare iridescent violet fronds for colour contrast against the green. The first pass
   // used a saturated magenta, which became the loudest object in an otherwise cold frame
   // once the seabed cover was tamed - so the green channel is lifted close to red (drier
@@ -1203,7 +1211,9 @@ function buildKelpMesh(rng) {
   // and float upward, which is what opens the understory up for the camera to fly
   // through. Radial extents are in "radius units" (the VS multiplies by the instance
   // radius, 2.4-4.0, so 1 unit ~ 3 m); y is a fraction of the 25-60 m stalk height.
-  const nodes = CFG.kelpNodes, ROWS = 6;
+  // ROWS also sets how finely the serrated margin is sampled: below ~8 rows the teeth
+  // alias into one random bump per blade instead of a fringe.
+  const nodes = CFG.kelpNodes, ROWS = 8;
   for (let nd = 0; nd < nodes; nd++) {
     const t0 = 0.48 + 0.52 * Math.pow(nd / (nodes - 1), 0.75);   // bare column, leafy crown
     const crown = 1 + 0.60 * smoothstep(0.62, 1.0, t0);
@@ -1218,17 +1228,24 @@ function buildKelpMesh(rng) {
       const droop = 0.006 + 0.010 * rng();       // ... easing off near the tip
       const twist = (rng() - 0.5) * 0.9;         // ribbon twist along the length
       const off = 0.09;                          // clear of the thicker stipe
+      // A perfectly smooth ribbon edge is what made a frond read as a paper cut-out. Two
+      // incommensurate sines along the length give a frilled, slightly torn margin, and
+      // the two sides use different phases so the blade is not symmetric either.
+      const frillA = 13.0 + 4.0 * rng(), frillB = 20.0 + 6.0 * rng();
       for (let j = 0; j <= ROWS; j++) {
         const t = j / ROWS;
         const rad = off + len * t;
-        const w = wid * Math.sin(Math.PI * Math.min(1, 0.14 + t * 0.92)) * (1 - 0.34 * t);
+        const wBase = wid * Math.sin(Math.PI * Math.min(1, 0.14 + t * 0.92)) * (1 - 0.34 * t);
+        const serrA = 1 + 0.13 * Math.sin(t * frillA) + 0.06 * Math.sin(t * frillB + 0.7);
+        const serrB = 1 + 0.13 * Math.sin(t * frillB + 2.1) + 0.06 * Math.sin(t * frillA + 1.9);
+        const wL = wBase * serrA, wR = wBase * serrB;
         const y = v0 + rise * t - droop * Math.pow(t, 2.2);
         const px = ca * rad, pz = sa * rad;
         const roll = twist * t;                  // roll the ribbon about its own axis
         const rcos = Math.cos(roll), rsin = Math.sin(roll);
         const ny1 = 0.45 * rcos + 0.55, ny2 = ny1;
-        push(px - tx * w * rcos, y + w * rsin * 0.5, pz - tz * w * rcos, ca * 0.35, ny1, sa * 0.35, 0, v0 + t * 0.05);
-        push(px + tx * w * rcos, y - w * rsin * 0.5, pz + tz * w * rcos, ca * 0.35, ny2, sa * 0.35, 1, v0 + t * 0.05);
+        push(px - tx * wL * rcos, y + wL * rsin * 0.5, pz - tz * wL * rcos, ca * 0.35, ny1, sa * 0.35, 0, v0 + t * 0.05);
+        push(px + tx * wR * rcos, y - wR * rsin * 0.5, pz + tz * wR * rcos, ca * 0.35, ny2, sa * 0.35, 1, v0 + t * 0.05);
       }
       for (let j = 0; j < ROWS; j++) {
         const a = vi + j * 2, b2 = a + 1, c = a + 2, d = a + 3;
