@@ -489,8 +489,13 @@ fn bedNoise(p : vec3<f32>) -> f32 {
   var gc = sstep(0.40, 0.60, fbm2(wp.xz * 0.028, 2) * 0.65 + fbm2(wp.xz * 0.085 + 4.0, 2) * 0.35);
   gc *= 1.0 - sstep(0.28, 0.55, slope);
   let gcHue = 0.5 + 0.5 * sin(wp.x * 0.05 + wp.z * 0.045 + nz * 5.0);
-  let magenta = mix(vec3<f32>(0.150, 0.030, 0.108), vec3<f32>(0.380, 0.095, 0.245), gcHue);
-  alb = mix(alb, magenta, gc * 0.82);
+  // The cover used to be a saturated magenta carpet: at 30 m it read as a second image
+  // pasted over the blue scene. Drier colour, less coverage, and it leans toward the
+  // water colour the deeper it lies, so floor and haze keep one palette.
+  let gcWarm = mix(vec3<f32>(0.118, 0.046, 0.100), vec3<f32>(0.292, 0.132, 0.216), gcHue);
+  let gcCool = mix(gcWarm, vec3<f32>(0.086, 0.114, 0.168),
+                   0.50 * clamp((u.camBasis.z - wp.y) / 96.0, 0.0, 1.0));
+  alb = mix(alb, gcCool, gc * 0.70);
   // fine speckle so the floor never reads as smooth plaster; fades out with distance
   // so the high-frequency term cannot alias into a shimmering checkerboard
   alb *= 0.92 + 0.16 * mix(h31(floor(wp * 1.30)), fbm3(wp * vec3<f32>(1.30, 1.55, 1.30), 2),
@@ -504,7 +509,7 @@ fn bedNoise(p : vec3<f32>) -> f32 {
   let skyUp = 0.5 + 0.5 * n.y;
   var light = u.sunColor.rgb * u.sunDir.w * (sd * 0.40 + wsd * 0.26)
             + waterTint(max(u.camBasis.z - wp.y, 0.0)) * u.params0.z * (1.30 + 0.85 * skyUp)
-            + vec3<f32>(0.085, 0.022, 0.048) * u.params0.z * gc;   // magenta bounce
+            + vec3<f32>(0.058, 0.028, 0.044) * u.params0.z * gc;   // cover bounce
   // caustics on upward faces
   let ca = caustics(wp.xz + vec2<f32>(1.0, 0.4) * u.camPos.w * 0.35, u.camPos.w * 0.55);
   light += vec3<f32>(0.42, 0.92, 0.95) * ca * u.params0.y * 0.45 * (max(n.y, 0.0) * causticVisibility(wp.y, dist));
@@ -772,7 +777,7 @@ fn pal(t : f32, a : vec3<f32>, b : vec3<f32>, c : vec3<f32>, d : vec3<f32>) -> v
   // magenta encrusting cover: patchy growth that favours quiet upward faces, but with
   // a 3D boundary so it never paints a clean "pink cap" across the top of a boulder
   let cov = sstep(0.46, 0.72, fbm2(wp.xz * 0.24 + wp.y * 0.16 + seed * 3.0, 2)) * up * up;
-  alb = mix(alb, vec3<f32>(0.28, 0.050, 0.185), cov * 0.55);
+  alb = mix(alb, vec3<f32>(0.215, 0.090, 0.170), cov * 0.50);
   // green film in the crevices
   alb = mix(alb, vec3<f32>(0.11, 0.22, 0.10), sstep(0.35, 0.05, grain) * 0.30);
 
@@ -785,18 +790,22 @@ fn pal(t : f32, a : vec3<f32>, b : vec3<f32>, c : vec3<f32>, d : vec3<f32>) -> v
   // and a magenta bounce off the cover.
   var light = u.sunColor.rgb * u.sunDir.w * (sd * 0.42 + wsd * 0.34)
             + waterTint(max(u.camBasis.z - wp.y, 0.0)) * u.params0.z * (1.45 + 0.80 * skyUp)
-            + vec3<f32>(0.10, 0.028, 0.062) * u.params0.z * (1.0 - skyUp);
+            + vec3<f32>(0.070, 0.034, 0.056) * u.params0.z * (1.0 - skyUp);
   if (dist < 85.0) {
     let ca = caustics(wp.xz + vec2<f32>(1.0, 0.4) * u.camPos.w * 0.35, u.camPos.w * 0.55);
     light += vec3<f32>(0.42, 0.92, 0.95) * ca * u.params0.y * 0.42 * up * causticVisibility(wp.y, dist);
   }
   var col = alb * light * (0.80 + 0.34 * grain);
-  // iridescent sheen on coral and carved stone
-  if (kind > 3.5) {
+  // Iridescent sheen: coral wears it at full strength, carved stone only a whisper -
+  // on a flat plinth face a full band reads as a painted rainbow edge.
+  var sheen = 0.0;
+  if (kind > 3.5 && kind < 4.5) { sheen = 0.30; }
+  if (kind > 5.5) { sheen = 0.10; }
+  if (sheen > 0.0) {
     let fres = cube(max(1.0 - max(dot(n, -dir), 0.0), 0.0));
     col += pal(fres * 0.8 + tint + u.camPos.w * 0.02,
                vec3<f32>(0.30, 0.16, 0.36), vec3<f32>(0.30, 0.20, 0.24),
-               vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(0.30, 0.55, 0.75)) * fres * 0.30;
+               vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(0.30, 0.55, 0.75)) * fres * sheen;
   }
   return vec4<f32>(fogBlend(col, dist, mix(u.camPos.xyz, wp, 0.5), dir, 0.0), 1.0);
 }
@@ -1237,12 +1246,17 @@ function placeFlora(rng) {
     if (t) stages.push([p.x, p.z, t.x, t.z]);
   }
   const onStage = (x, z) => {
+    // a clearing around every viewpoint: a canopy that starts 3 m from the lens wipes
+    // out the composition, and the fronds reach further than the base position does
+    for (const p of POSES) {
+      if (Math.hypot(x - p.x, z - p.z) < 10.0) return true;
+    }
     for (const s of stages) {
       const ex = s[2] - s[0], ez = s[3] - s[1];
       const len2 = ex * ex + ez * ez;
       const u = len2 > 1e-6 ? clamp(((x - s[0]) * ex + (z - s[1]) * ez) / len2, 0, 1) : 0;
       const px = s[0] + ex * u, pz = s[1] + ez * u;
-      if (Math.hypot(x - px, z - pz) < 7.5 + 3.5 * u) return true;   // widens toward the piece
+      if (Math.hypot(x - px, z - pz) < 9.0 + 5.0 * u) return true;   // widens toward the piece
     }
     return false;
   };
