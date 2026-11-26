@@ -749,10 +749,11 @@ fn pal(t : f32, a : vec3<f32>, b : vec3<f32>, c : vec3<f32>, d : vec3<f32>) -> v
               vec3<f32>(1.00, 0.90, 0.85), vec3<f32>(0.10, 0.32, 0.62));
     alb *= 0.72 + 0.52 * poly;
   } else if (kind > 4.5 && kind < 5.5) {
-    // barnacled ship timber: grey-brown planks with pale growth
+    // barnacled ship timber: grey-brown planks with pale growth. Kept well above the
+    // rock albedos - a dark hull at 30 m in this haze reads as a shapeless shadow.
     let plank = 0.5 + 0.5 * sin(wp.y * 2.4 + wp.x * 0.5 + seed * 6.0);
-    alb = mix(vec3<f32>(0.085, 0.070, 0.058), vec3<f32>(0.215, 0.180, 0.140), grain);
-    alb = mix(alb, vec3<f32>(0.30, 0.30, 0.26), smoothstep(0.72, 0.98, plank) * 0.55);
+    alb = mix(vec3<f32>(0.150, 0.122, 0.098), vec3<f32>(0.345, 0.290, 0.225), grain);
+    alb = mix(alb, vec3<f32>(0.44, 0.43, 0.38), smoothstep(0.72, 0.98, plank) * 0.55);
     alb = mix(alb, vec3<f32>(0.24, 0.34, 0.20), smoothstep(0.45, 0.9, fbm3(wp * 0.9, 2)) * 0.35);
   } else if (kind > 5.5) {
     // carved stone: pale, banded, encrusted at the base
@@ -1219,6 +1220,25 @@ function placeFlora(rng) {
   const out = new Float32Array(12 * CFG.kelpMax);
   const step = 3.1, hw = 96;
   const sx0 = CFG.startPos[0], sz0 = CFG.startPos[2];
+  // Every critic pose that stares at a set piece needs an open stage: no stalks in the
+  // wedge between lens and piece, and none on the piece's own shelf. Without this the
+  // hull and the fluke are chopped up by foreground stipes and stop reading as objects.
+  const stages = [];
+  for (const p of POSES) {
+    if (!p.look) continue;
+    const t = SET[p.look];
+    if (t) stages.push([p.x, p.z, t.x, t.z]);
+  }
+  const onStage = (x, z) => {
+    for (const s of stages) {
+      const ex = s[2] - s[0], ez = s[3] - s[1];
+      const len2 = ex * ex + ez * ez;
+      const u = len2 > 1e-6 ? clamp(((x - s[0]) * ex + (z - s[1]) * ez) / len2, 0, 1) : 0;
+      const px = s[0] + ex * u, pz = s[1] + ez * u;
+      if (Math.hypot(x - px, z - pz) < 7.5 + 3.5 * u) return true;   // widens toward the piece
+    }
+    return false;
+  };
   let n = 0;
   for (let z = -half; z <= half; z += step) {
     for (let d = -hw; d <= hw; d += step) {
@@ -1227,6 +1247,7 @@ function placeFlora(rng) {
       const xx = canyonCenter(zz) + d + (rng() - 0.5) * step * 1.6;
       const dd = Math.abs(xx - canyonCenter(zz));
       if (dd > hw) continue;
+      if (onStage(xx, zz)) continue;         // keep the set-piece sightlines clear
       const dens = fbm2(xx * 0.017 + 5.5, zz * 0.017 - 2.5, 3);
       let p = (dens - 0.30) * 2.1;                   // patches, not a solid wall
       p *= 1 - smoothstep(hw * 0.72, hw, dd);         // thin out toward the walls
@@ -1394,8 +1415,8 @@ function buildArch(rng) {
     const wob = 1 + 0.16 * (fbm3s(u * 4.0, 2.2, 6.6) - 0.5) * 2;
     for (let i = 0; i <= S; i++) {
       const b = (i / S) * 6.2831853, cb = Math.cos(b), sb = Math.sin(b);
-      const rr = 0.15 * wob * (1 - 0.25 * Math.sin(u * Math.PI));
-      const rz = 0.46 * wob;
+      const rr = 0.27 * wob * (1 - 0.30 * Math.sin(u * Math.PI));
+      const rz = 0.58 * wob;
       const px = ca * (R + rr * cb), py = sa * (R + rr * cb), pz = sb * rz;
       const nx = ca * cb, ny = sa * cb, nz = sb * 0.5;
       const l = Math.hypot(nx, ny, nz) || 1;
@@ -1458,7 +1479,7 @@ function layoutArches() {
   for (let i = 0; i < 9; i++) {
     const z = -186 + i * 44 + (rng() - 0.5) * 12;
     const x = canyonCenter(z) + (rng() - 0.5) * 22;
-    SET.arches.push({ x: x, z: z, y: bedHeight(x, z), s: 13 + 10 * rng(), sy: 1.20 + 0.45 * rng(),
+    SET.arches.push({ x: x, z: z, y: bedHeight(x, z), s: 17 + 11 * rng(), sy: 1.05 + 0.35 * rng(),
                       rx: (rng() - 0.5) * 0.06, ry: (rng() - 0.5) * 0.22, rz: (rng() - 0.5) * 0.06,
                       tint: rng() * 0.2, seed: rng(), isPose: false });
   }
@@ -1531,19 +1552,31 @@ function buildShip(rng) {
   cap(0, (0 - 0.5) * L);
   return makeGeo(new Float32Array(v2), new Uint32Array(idx2));
 }
-// Stone whale fluke: an elliptical blade lofted across the span, tipped up in the middle.
+// Stone whale fluke: an elliptical blade lofted across the span, tipped up in the middle,
+// carved with shallow flutes and standing on a square-cut plinth. Without the carving and
+// the base it reads as a smooth boulder instead of an erected monument.
 function buildFluke(rng) {
   const NS = 22, NR = 8;
+  const chAt = x => 0.60 * Math.pow(Math.max(0, 1 - Math.pow(Math.abs(x), 1.55)), 0.62) + 0.035;
+  const thAt = x => 0.075 * Math.pow(Math.max(0, 1 - Math.pow(Math.abs(x), 1.2)), 0.8) + 0.010;
+  const ycAt = x => -0.30 * Math.pow(Math.abs(x), 1.75) + 0.055;
+  // three crests across the span - straight-line carving a chisel could leave
+  const fluteAt = x => 1 + 0.17 * Math.pow(Math.max(0, Math.sin(x * 7.4 + 0.45)), 6);
   const pos = (i, j) => {
-    const u = i / NS, x = (u - 0.5) * 2, ax = Math.abs(x);
-    const ch = 0.60 * Math.pow(Math.max(0, 1 - Math.pow(ax, 1.55)), 0.62) + 0.035;
-    const th = 0.075 * Math.pow(Math.max(0, 1 - Math.pow(ax, 1.2)), 0.8) + 0.010;
-    const yc = -0.30 * Math.pow(ax, 1.75) + 0.055;
+    const u = i / NS, x = (u - 0.5) * 2;
     const b = (j / NR) * 6.2831853;
+    const fl = fluteAt(x);
     const wob = 0.02 * (fbm3s(u * 6.0, j * 1.7, 3.3) - 0.5) * 2;
-    return [x, yc + Math.sin(b) * th + wob, Math.cos(b) * ch + wob * 0.5];
+    return [x, ycAt(x) + Math.sin(b) * thAt(x) * fl + wob,
+            Math.cos(b) * chAt(x) * (1 + 0.06 * (fl - 1)) + wob * 0.5];
   };
-  return gridMesh(NR, NS, pos);
+  const geo = gridMesh(NR, NS, pos);
+  const v2 = Array.prototype.slice.call(geo.verts);
+  const idx2 = Array.prototype.slice.call(geo.idx);
+  // Plinth under the lower chord edge. rx = +90 deg maps local -z to world up, so the
+  // base sits at +z: from inside the blade straight down into the shelf.
+  sweep(v2, idx2, u => [0, 0, 0.46 + u * 0.42], () => 0.50, 1, 4, true, true);
+  return makeGeo(new Float32Array(v2), new Uint32Array(idx2));
 }
 // ---------------- prop placement ----------------
 // 16 floats per instance: pos+scale | rot+scaleY | tint seed kind extra | bob bobFreq spin pad
@@ -1662,8 +1695,9 @@ function placeProps(rng) {
     const b = bedHeight(SET.ship.x, SET.ship.z);
     SET.ship.y = b;
     // hull axis is its local z, so yaw 0.95 presents a three-quarter broadside to the
-    // viewpoint; rz lists it 10 deg to one side like a hull settled in silt
-    put(SET.ship.x, b + 5.0, SET.ship.z, 1.45, 0.05, 0.95, -0.18, 1.0, 0.5, 0.31, 5, 0, 0, 0, 0);
+    // viewpoint; rz lists it 10 deg to one side like a hull settled in silt. The scale
+    // is what makes the ribs and masts legible from the viewpoint ~33 m away.
+    put(SET.ship.x, b + 6.5, SET.ship.z, 1.72, 0.05, 0.95, -0.18, 1.0, 0.5, 0.31, 5, 0, 0, 0, 0);
   }
   close('ship', 'ship', f);
   f = n;
@@ -1673,7 +1707,7 @@ function placeProps(rng) {
     // The blade is modelled flat (span = local x, chord = local z, faces = +-y).
     // rx = 90 deg stands it up so the chord is vertical; ry = 90 deg then swings its
     // face normal onto +x, straight at the viewpoint down the corridor.
-    put(SET.fluke.x, b + 8.5, SET.fluke.z, 15.0, 1.5708, 1.5708, 0.10, 1.0, 0.5, 0.77, 6, 0, 0, 0, 0);
+    put(SET.fluke.x, b + 11.0, SET.fluke.z, 16.0, 1.5708, 1.5708, 0.10, 1.0, 0.5, 0.77, 6, 0, 0, 0, 0);
   }
   close('fluke', 'fluke', f);
   return { data: data.subarray(0, n * 16), n, groups };
@@ -1977,8 +2011,8 @@ const tour = { on: false, t: 0, dur: 30, span: new Float32Array(3), pitch: 0, ya
 const POSES = [
   { name: 'canyon-start',    dx: -12, z: 92,  y: 2,   yaw: 0.03,  pitch: -0.02 },
   { name: 'look-up-surface', dx: 2,   z: 52,  y: -8,  yaw: -0.20, pitch: 1.02 },
-  { name: 'ship-hull',       dx: -2,  z: 56,  y: -8,  look: 'ship',  lookY: 5,  lookDx: -34, lookDz: 30 },
-  { name: 'fluke-garden',    dx: 9,   z: -28, y: -11, look: 'fluke', lookY: 6,  lookDx: 36,  lookDz: 2 },
+  { name: 'ship-hull',       dx: -2,  z: 56,  y: -8,  look: 'ship',  lookY: 5,  lookDx: -25, lookDz: 21 },
+  { name: 'fluke-garden',    dx: 9,   z: -28, y: -11, look: 'fluke', lookY: 8,  lookDx: 27,  lookDz: 2 },
   { name: 'kelp-corridor',   dx: -6,  z: -16, y: -10, yaw: 0.12,  pitch: 0.12 },
   { name: 'deep-arch',       dx: -4,  z: -92, y: -14, look: 'arch', lookY: 10, standoff: 44 },
 ];
