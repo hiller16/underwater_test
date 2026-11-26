@@ -60,7 +60,7 @@
 ### 本輪修掉的缺陷
 | 缺陷 | 根因 | 處置 | 驗證 |
 |---|---|---|---|
-| 畫面中純黑塊（major→blocker） | mote 精靈的 NaN alpha 進 HDR buffer，經 bloom 擴散成黑卡；另 VS 四角公式 `*4` 應為 `*2` | VS 加 `!(d >= 1.2)` 剔除；FS 加 `!(s>=0)||!(s<4e4)` discard | `tools/scan.js` pose0/pose3 @1280×720 → 0 blobs（此前 1–3 個 48×48～60×52） |
+| 畫面中純黑塊（major→blocker） | mote 精靈的 NaN alpha 進 HDR buffer，經 bloom 擴散成黑卡；另 VS 四角公式 `*4` 應為 `*2` | VS 加 `!(d >= 1.2)` 剔除；FS 加 `!(s>=0)\|\|!(s<4e4)` discard | `tools/scan.js` pose0/pose3 @1280×720 → 0 blobs（此前 1–3 個 48×48～60×52） |
 | pose5 整張平坦藍（blocker） | `finalizePoses()` 執行時 `SET.arches` 還是空的 → yaw/pitch = NaN | 新增 `layoutArches()`，順序改為 layoutArches → finalizePoses → buildCamPath | pose5 恢復內容（mean 0.339，edge 0.049） |
 | 相機埋進岩石 / 布景看不到 | 大道具隨機落在視點上 | 新增相機走廊 `CAMPTS`（6 poses ±9 m 擺頭 + 120 個 tour 取樣），大道具落在管內就剔除；arch 改為對準視點（standoff 44）；tour 相機鉗在 bed+12 | 各 pose 不再出現整屏單色 |
 | 布景方向錯誤（船殼側邊、鯨尾成細片） | `rot3` 旋轉順序為 Y→X→Z，yaw 先做 | 改為 roll→pitch→yaw（yaw 最後）；船殼 yaw 0.95 + 10° 傾側；鯨尾 rx90 站起再 ry90 轉向走廊 | 第 3 輪 `_view/f1.jpg` 已肉眼覆核通過 |
@@ -74,6 +74,8 @@
 ## 2. 驗證結果
 
 ### 2.1 Visual critic（只准看 render，不準看 code）
+
+> 交付用的最終評語（六輪摘要、缺陷→修法→驗證、判定與保留的取捨）在 `docs/reports/critic.md`。
 狀態：**0 blocker、0 major，`_rev10` 清單上的 minor 也已全數收完**（第 5 輪 a/b/c，見下方第 5 輪表）。
 第 3 輪修完 `_rev9` 的 1 blocker + 4 major；第 4 輪修完 `_rev10` 的 2 個 major（pose4 洗白、iridescent 葉過飽和）
 與 4 個 minor（莖無節／肋骨看不見／貼鏡葉片／生命體不可見）；第 5 輪收掉剩下的 3 個 minor
@@ -169,7 +171,7 @@ critic 清單的累計處理進度：
 
 | # | 缺陷 | 做了什麼 | 驗證 |
 |---|---|---|---|
-| c | 葉片仍像平滑卡片（無葉緣鋸齒、無中肋、無沿葉色相變化） | 葉緣用兩個不同頻率的鋸齒（`frillA` 13–17、`frillB` 20–26，兩側相位不同），`ROWS` 6→8（低於 8 列時鋸齒會 alias 成一個隨機凸起）；`kelpFS` 加中肋（`1-|2u-1|` → albedo ×0.84–1.08）與 canopy 金綠漸層（依 `wp.y` 靠水面偏金 `1.14/1.02/0.62`）；近距 grain 由 `fbm3(0.9,0.32,0.9)×2` 改 `(1.35,0.48,1.35)×3` | pose4 中部 region **std 0.0743 → 0.1107**（+49% 細節）；`_view/g5.jpg`（`crop.js` 1.4×）可見到波浪葉緣、中肋與氣囊串；1200p 20 s tour gpuMs avg 7.41 / p99 12.3 |
+| c | 葉片仍像平滑卡片（無葉緣鋸齒、無中肋、無沿葉色相變化） | 葉緣用兩個不同頻率的鋸齒（`frillA` 13–17、`frillB` 20–26，兩側相位不同），`ROWS` 6→8（低於 8 列時鋸齒會 alias 成一個隨機凸起）；`kelpFS` 加中肋（`1-\|2u-1\|` → albedo ×0.84–1.08）與 canopy 金綠漸層（依 `wp.y` 靠水面偏金 `1.14/1.02/0.62`）；近距 grain 由 `fbm3(0.9,0.32,0.9)×2` 改 `(1.35,0.48,1.35)×3` | pose4 中部 region **std 0.0743 → 0.1107**（+49% 細節）；`_view/g5.jpg`（`crop.js` 1.4×）可見到波浪葉緣、中肋與氣囊串；1200p 20 s tour gpuMs avg 7.41 / p99 12.3 |
 | b | tour 有幾格被大片葉面糊住（`_view/t12.jpg` 的 f003） | `placeFlora` 在硬排除圈（3.2 m ×0.42）外再加軟性稀釋環（**7.0 m ×0.68**，因為葉片可從莖外伸 4–6 m） | tour 12 格 **edge 均值 0.0388 → 0.0437、最差格 0.0172 → 0.0249（+45%）、最低 std 0.0845 → 0.1013**；`_view/g6.jpg`：原本以為變差的 f001/f009 其實是好格（石拱、石雕＋魚群入鏡），仍留下的 f004 是「貼著葉面飛」這種合法但平淡的鏡頭 |
 | a | 船殼肋骨／木板在 33 m 外只剩平滑灰牆 | `buildShip` 加 4 條縱向舷帶（`jS = 2/4/6/8`、r = 0.13 的純幾何，會自己產生陰影；world-space 花紋在偏轉＋傾側的船殼上會滑過表面而不是貼在木板上，所以不用 shader 花紋）；木料 kind 的 crackle 距離窗 40 → 72 m | pose2 全圖 **edge 0.0413 → 0.0459、std 0.1533 → 0.1624**；`_view/g7.jpg`（上＝修前、下＝修後）可清楚看到木板線 |
 
@@ -210,6 +212,8 @@ critic 清單的累計處理進度：
 
 
 ### 2.2 效能（scripted fly-through，fenced = 每幀等 `onSubmittedWorkDone`）
+
+> 交付用的整理版（含場景負載實例數、per-pass 解讀、量測陷阱與重現指令）在 `docs/reports/perf.md`。
 
 | run | size | 條件 | frames | avg | p50 | p99 | p999 | max | 0.1% low (fps) |
 |---|---|---|---|---|---|---|---|---|---|
@@ -385,9 +389,10 @@ node tools\dbg.js --param "hide=kelp,props" --eval "__scene.setPose(0)" --shot _
 1. **交付前清暫存目錄**（`_rev*`、`_fix*`、`_perf*`、`_diag`、`_t_*`、`_view`、`_test`，全在 `.gitignore` 的 `_*/` 內）：
    `Get-ChildItem -Directory -Filter '_*' | Remove-Item -Recurse -Force`（先確認沒有要留的覆核圖，
    或先把 `_view/*.jpg` 裡想留的几张搬進 `docs/images/`）。
-2. **交付三件套**（計畫 WP9）：`index.html`（138.0 KiB raw / 93.9 KiB min / 33.2 KiB gzip）
-   ＋ 效能報告（本檔 §2.2，含 1200p 三列）＋ critic 最終評語（本檔 §2.1 第 5–6 輪表、`_rev13`／`_rev14` 判定）。
-   若要獨立成檔，從 §2.2／§2.1 拆出 `docs/reports/perf.md`、`docs/reports/critic.md` 即可，不必重跑量測。
+2. **交付三件套**（計畫 WP9）：**已完成**——`index.html`（138.0 KiB raw / 93.9 KiB min / 33.2 KiB gzip）
+   ＋ `docs/reports/perf.md`（環境、負載實例數、1200p/1080p 結果、per-pass、timestamp 限制、量測陷阱、重現指令）
+   ＋ `docs/reports/critic.md`（方法、六輪摘要與缺陷→修法→驗證、最終判定、保留的取捨、判讀限制）。
+   本檔 §2.1／§2.2 仍是原始留檔，報告是整理版；數字若要更新兩邊都要改。
 3. **可選（低 CP）**：
    - tour 仍有一格偏平淡（`_rev14t` 的 f006，edge 3.08）——要嘛改 `tourSample()` 的 y／橫向相位繞開藻冠，
      要嘛接受為穿林過場；驗收 `node tools\shoot.js --size 1280x720 --poses none --tour 20 --tour-frames 12 --out _tour2`
