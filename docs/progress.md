@@ -1,6 +1,6 @@
 ﻿# Kelp Cathedral — 進度紀錄
 
-> 更新時間：2026-11-26（第 4 輪：`_rev10` 的 2 個 major + 4 個 minor 全修完並逐項截圖覆核）。
+> 更新時間：2026-11-26（第 5 輪：`_rev10` 殘留的 3 個 minor 全收、`npm test`（WP9）上線、1920×1200 效能重測完成）。
 > 單一交付檔 `index.html`（WebGPU、全程序化、無引擎）。
 > 圖片通道已恢復（可讀 ≤960 寬 JPEG），本輪的視覺判斷是肉眼 + 數值工具並行。
 
@@ -66,15 +66,18 @@
 | 布景方向錯誤（船殼側邊、鯨尾成細片） | `rot3` 旋轉順序為 Y→X→Z，yaw 先做 | 改為 roll→pitch→yaw（yaw 最後）；船殼 yaw 0.95 + 10° 傾側；鯨尾 rx90 站起再 ry90 轉向走廊 | 第 3 輪 `_view/f1.jpg` 已肉眼覆核通過 |
 | 「魚群」在畫面裡看不見（第 4 輪） | `fishVS` 的軌道半徑 `13 + 30·fract(sc·0.618)` m → 一群魚其實是直徑 26–86 m 的空心殼，群心對準鏡頭時成員反而散到鏡頭前後 | `i1.w` 由擺尾相位改為軌道半徑縮放（擺尾相位改用 `fract(sc·7.13)` hash），錨定 pose 的群用 0.16–0.30，`ext/wide` 也同步縮小 | `_view/g4.jpg` pose0/2/4 都看得到銀色魚群；`dbg.js` 投影確認群心在框內 |
 | kelp 加氣囊時網格錯位風險 | `sweep()` 每頂點寫 6 floats，但 kelp pipeline 是 `arrayStride: 32`（pos+normal+uv 共 8 floats） | 氣囊改用 kelp 自己的 `push()`（8 floats）建八面體並手寫索引 | `errors: []`、`_t_minor/k0.png` 葉柄基部可見小球 |
+| `crop.js` 裁出的 tile 在瀏覽器裡全黑（第 5 輪） | 非整數 scale（470×1.25 = 587.5）時 IHDR 寬度被 `writeUInt32BE` 截斷成 587，而行距仍是 587.5×3 → 解碼錯位 | 輸出尺寸改 `Math.round(...)` 並設下限 1 | 同一裁切 `png.js mean` 0.3648（黑幀是 0）、contact sheet 由 3.8 KB 變成 55 KB |
+| `tests/verify.js` 第一版 7 項紅 | 我把 `cam.y` 拿去比 `POSES[i].z`；另外開頁後 1 s 內 rAF 還在編 pipeline，幀數幾乎不推進 | 索引改成 `cam.xz` 對 `POSES[i].xz`；量幀前先 `sleep(1200)` 讓迴圈穩定 | 17/17 passed、`npm.cmd test` exit 0 |
 
 ---
 
 ## 2. 驗證結果
 
 ### 2.1 Visual critic（只准看 render，不準看 code）
-狀態：**0 blocker、0 major，只剩 1 個 minor（船殼肋骨的近距離辨識度）**。
-第 3 輪修完 `_rev9` 的 1 blocker + 4 major；第 4 輪把 `_rev10` 的 2 個 major（pose4 洗白、iridescent 葉過飽和）
-與 4 個 minor（莖無節／肋骨看不見／貼鏡葉片／生命體不可見）逐項修完，每項截圖覆核並各自 commit。
+狀態：**0 blocker、0 major，`_rev10` 清單上的 minor 也已全數收完**（第 5 輪 a/b/c，見下方第 5 輪表）。
+第 3 輪修完 `_rev9` 的 1 blocker + 4 major；第 4 輪修完 `_rev10` 的 2 個 major（pose4 洗白、iridescent 葉過飽和）
+與 4 個 minor（莖無節／肋骨看不見／貼鏡葉片／生命體不可見）；第 5 輪收掉剩下的 3 個 minor
+（葉片質感、tour 貼葉面、船殼木板紋理）。每項都是「改一項 → 截圖或數值覆核 → commit」。
 判讀限制：總覽圖每格只有 480×270，細節一律用 `crop.js` 裁 ≤480 寬小圖再看。
 
 #### `_rev9` 缺陷清單與本輪修法（留檔）
@@ -159,12 +162,35 @@ critic 清單的累計處理進度：
   白霧過曝 / 近景硬切 / 地面洋紅。
 - 已肉眼覆核並通過：道具可辨識度（`_view/f1.jpg`、`f5.jpg`）、god ray 不再 milky（`f3.jpg`）、
   近景巨莖淡出（`f4.jpg`）、地面色彩（`f5.jpg`）。
-- 仍未定案：pose1 banding（要 1280×720 PNG + `png.js`）、葉緣鋸齒與肋骨紋（要 `crop.js` 小圖）。
+- 第 5 輪已定案：葉緣鋸齒／中肋（`_view/g5.jpg`）、船殼木板紋（`_view/g7.jpg`）。
+  仍未定案：pose1 白色漸層的 banding（要 1280×720 PNG + `png.js` 逐像素看 gradient）。
+
+#### 第 5 輪：`_rev10` 殘留的 3 個 minor（已全部收掉）
+
+| # | 缺陷 | 做了什麼 | 驗證 |
+|---|---|---|---|
+| c | 葉片仍像平滑卡片（無葉緣鋸齒、無中肋、無沿葉色相變化） | 葉緣用兩個不同頻率的鋸齒（`frillA` 13–17、`frillB` 20–26，兩側相位不同），`ROWS` 6→8（低於 8 列時鋸齒會 alias 成一個隨機凸起）；`kelpFS` 加中肋（`1-|2u-1|` → albedo ×0.84–1.08）與 canopy 金綠漸層（依 `wp.y` 靠水面偏金 `1.14/1.02/0.62`）；近距 grain 由 `fbm3(0.9,0.32,0.9)×2` 改 `(1.35,0.48,1.35)×3` | pose4 中部 region **std 0.0743 → 0.1107**（+49% 細節）；`_view/g5.jpg`（`crop.js` 1.4×）可見到波浪葉緣、中肋與氣囊串；1200p 20 s tour gpuMs avg 7.41 / p99 12.3 |
+| b | tour 有幾格被大片葉面糊住（`_view/t12.jpg` 的 f003） | `placeFlora` 在硬排除圈（3.2 m ×0.42）外再加軟性稀釋環（**7.0 m ×0.68**，因為葉片可從莖外伸 4–6 m） | tour 12 格 **edge 均值 0.0388 → 0.0437、最差格 0.0172 → 0.0249（+45%）、最低 std 0.0845 → 0.1013**；`_view/g6.jpg`：原本以為變差的 f001/f009 其實是好格（石拱、石雕＋魚群入鏡），仍留下的 f004 是「貼著葉面飛」這種合法但平淡的鏡頭 |
+| a | 船殼肋骨／木板在 33 m 外只剩平滑灰牆 | `buildShip` 加 4 條縱向舷帶（`jS = 2/4/6/8`、r = 0.13 的純幾何，會自己產生陰影；world-space 花紋在偏轉＋傾側的船殼上會滑過表面而不是貼在木板上，所以不用 shader 花紋）；木料 kind 的 crackle 距離窗 40 → 72 m | pose2 全圖 **edge 0.0413 → 0.0459、std 0.1533 → 0.1624**；`_view/g7.jpg`（上＝修前、下＝修後）可清楚看到木板線 |
+
+嘗試過但**回退**的調整：把 kelp 貼鏡溶解視窗由 1.2–6.5 m 再放寬到 1.2–7.8 m、floor 0.15→0.10。
+理由是 tour 12 格 edge 均值從 0.0420 掉到 0.0364（前景化開之後結構更少），屬「把貼葉面換成霧」而非改善。
+
+#### 第 5 輪最終覆核：`_rev13`（6 poses @1920×1080 + tour 12 s／12 格）＋ `_rev13p`（同場景 @1280×720 PNG，供數值工具）
+
+- 肉眼（`_view/c13.jpg`）：六格都有可辨識主體——pose0 魚群＋林相深度、pose1 太陽盤＋Snell window、
+  pose2 船殼（舷帶與桅杆可辨）、pose3 鯨尾石雕＋基座、pose4 逆陽但中距有石拱、pose5 魚群從石拱下穿過。
+  色調統一在冷青＋橄欖，最高飽和的物體不再是洋紅（`chromaMean` pose0 0.1452、pose2 0.1119）。
+- 數值：`scan.js` 六格 **0 blobs**；所有 run `errors: []`；`npm.cmd test` **17/17**。
+- 判定：**停止條件成立**（0 blocker / 0 major / critic 清單上的 minor 全收）。
 
 ### 2.2 效能（scripted fly-through，fenced = 每幀等 `onSubmittedWorkDone`）
 
 | run | size | 條件 | frames | avg | p50 | p99 | p999 | max | 0.1% low (fps) |
 |---|---|---|---|---|---|---|---|---|---|
+| `_perf1200b` | 1920×1200 | `--perf`（vsync，20 s tour，**第 5 輪最終狀態**：葉緣鋸齒＋中肋＋舷帶） | 2362 | 8.47 | 5.6 | 22.1 | 22.3 | 22.4 | 44.6 |
+| `_perf1200` | 1920×1200 | `--perf`（vsync，30 s tour，minor (c) 之前） | 3744 | 8.01 | 5.6 | 22.1 | 22.3 | 27.7 | 36.1 |
+| `_perf1200n` | 1920×1200 | `--perf --nolimit`（關 vsync，20 s tour） | 2559 | 7.82 | 7.5 | 12.6 | 14.2 | 17.0 | 58.8 |
 | `_t_perf` | 1920×1080 | `--perf`（vsync，8 s tour，第 4 輪最終狀態） | 964 | 8.32 | 5.6 | 16.8 | 22.2 | 22.3 | 44.8 |
 | `_rev10p` | 1920×1080 | `--perf`（vsync，8 s tour） | 954 | 8.40 | 5.6 | 22.3 | 22.4 | 22.4 | 44.6 |
 | `_fix2p` | 1920×1080 | `--perf`（vsync，6 s tour） | 832 | 7.22 | 5.6 | 16.8 | 16.8 | 16.8 | 59.5 |
@@ -172,14 +198,15 @@ critic 清單的累計處理進度：
 | `_perf5` | 1920×1080 | `--perf`（vsync 180 Hz） | 3041 | 7.90 | 5.6 | 22.3 | 27.8 | 33.4 | 29.9 |
 | `_perf4` | 1920×1200 | `--perf`（vsync） | 4096 | 6.82 | 5.6 | 16.8 | 16.9 | 22.2 | 45.0 |
 
-GPU 端（`gpuMs`，同一 submit 的 fence 往返）：`_t_perf` avg 7.29 / p99 11.8 / max 15.4；
-`_rev10p` avg 7.47 / p99 19.2 / max 24.7；
-`_fix2p` avg 6.23 / p99 10.4 / max 12.3；舊版 1080p avg 5.7 / p99 8.9 / max 19.7、
-1200p avg 6.01 / p99 9.7 / max 21.4。
-注意：`_t_perf` / `_rev10p` / `_fix2p` 都是 kelp 幾何加重（ROWS 5→6、頂端 perNode 最多 4、
-juvenile 0.17→0.24，第 4 輪再加每株約 270 個氣囊頂點 ≈ +39% kelp 頂點）之後的數字，
-且 tour 區間較短、取樣點不同，不能直接和 4096 幀的舊 run 比大小；
-1200p 在新 kelp 下尚未重測（見待辦 P1）。
+GPU 端（`gpuMs`，同一 submit 的 fence 往返）：**`_perf1200b`（最終狀態）avg 7.41 / p50 6.8 / p99 12.3 / max 16.8**；
+`_perf1200` avg 7.03 / p99 11.9 / max 18.3；`_perf1200n`（關 vsync）avg 7.65 / p99 12.2 / max 16.4；
+`_t_perf` avg 7.29 / p99 11.8 / max 15.4；`_rev10p` avg 7.47 / p99 19.2 / max 24.7；
+`_fix2p` avg 6.23 / p99 10.4 / max 12.3；舊版 1080p avg 5.7 / p99 8.9 / max 19.7。
+注意：`_t_perf` / `_rev10p` / `_fix2p` / `_perf1200*` 都是 kelp 幾何加重（ROWS 5→6→8、頂端 perNode 最多 4、
+juvenile 0.17→0.24，第 4 輪再加每株約 270 個氣囊頂點 ≈ +39% kelp 頂點，第 5 輪鋸齒再多 ~18% 葉面頂點）
+之後的數字，且 tour 區間較短、取樣點不同，不能直接和 4096 幀的舊 run 比大小。
+**1200p 已重測完成**（規格 WP7 的 target 是 avg 11–16 ms）：開 vsync 的 wall avg 8.0–8.5 ms、
+關 vsync 7.8 ms 且 p99 12.6 / max 17.0，都有餘裕；尾端 p999 22 ms 是 vsync 週期的跳格，不是場景变慢。
 
 逐 pass（`--profile`，`_perf5p` @1920×1080，每 pass 單獨 submit ×6 取平均）：
 
@@ -200,9 +227,25 @@ juvenile 0.17→0.24，第 4 輪再加每株約 270 個氣囊頂點 ≈ +39% kel
 或支援 inside-passes 的 build 上才會出現。
 
 ### 2.3 體積
-`node tools/check.js` → **raw 133.2 KiB | minified 92.1 KiB | gzip 32.4 KiB**（單檔，無外部資源）。
+`node tools/check.js` → **raw 135.6 KiB | minified 93.1 KiB | gzip 32.9 KiB**（單檔，無外部資源）。
+預算為 minified < 200 KiB（`tests/verify.js` 會擋）。
 
-### 2.4 驗證環境
+### 2.4 自動化測試（WP9，本輪新增）
+`npm test`（PowerShell 5.1 若被執行原則擋掉，改用 `npm.cmd test`）→ `tests/verify.js`，TAP 13，**17 項斷言**：
+
+| 組 | 斷言 |
+|---|---|
+| 靜態 | 單一檔案自含（沒有 `<script src>`／`<link>`／媒體元素／`fetch()`／`XMLHttpRequest`／ES module／CSS `url()`）；體積 ≤ 200 KiB |
+| 啟動 | `__scene.ready` 且 canvas 真的拿到 `webgpu` context；渲染迴圈 800 ms 內推進 > 20 幀；`performance` 的 resource entries = 0（運行期零外部請求） |
+| 相機 | `__scene.poses` 有 6 個；逐個 `setPose(i)` 後 `cam.xz` 與 `POSES[i].xz` 的偏移 < 0.01 m、`cam.y` 為有限值 |
+| 乾淨 | `console.error`／page exception = 0；`__scene.errors`（GPU）= 0 |
+| 畫面 | pose 0 / 2 / 5 各截一張 PNG，`png.js` 解碼後 `sd > 0.05`、`max-min > 0.3`、`0.03 < mean < 0.97`（黑幀、白幀、平 wash 都會紅） |
+
+反向驗證（證明斷言會紅，不是恒綠）：`node tests/verify.js _neg/blank.html`（把 `exposure` 改成 0 的副本）
+→ 最後 3 項 `not ok`（mean 0.006 / sd 0.008 / range 0.00..0.02）、exit 1。
+常用環境變數：`VERIFY_SIZE=1280x720`（預設 800×500）、`VERIFY_KEEP=1`（保留 `_test/` 的截圖）。
+
+### 2.5 驗證環境
 - 本機即目標硬體（Ryzen AI Max+ 395 / Radeon 8060S，Windows 11）。
 - 只有 Microsoft Edge 157.0.4341.60（Chromium 157，等同規格的 Chrome 157 內核），無 Chrome 品牌。
   無頭模式 `--headless=new`（不給 `--disable-gpu`）即可使用真 GPU。
@@ -213,32 +256,31 @@ juvenile 0.17→0.24，第 4 輪再加每株約 270 個氣囊頂點 ≈ +39% kel
 ## 3. 還沒解決的問題（依優先順序）
 
 **P0 — 完成門檻本身**
-1. **Visual critic：停止條件已達成**（0 blocker、0 major；見 §2.1 第 4 輪表，含追加的兩項）。
-   已跑過：6 poses @1920×1080（`_rev11`→修→`_rev12`）**以及** tour 序列
-   `--tour 12 --tour-frames 12`（`_rev11/tour/f000-f011.jpg`、覆核圖 `_view/t11.jpg`、`_view/t12.jpg`）。
-   下一輪如果還要收，只剩這些 minor（依價值排序）：
-   (a) 船殼肋骨／木板在 30 m 外的紋理解析度（`_t_f2/kh2.png` 只隱約可見）；
-   (b) tour 中貼著葉面飛的片段（`_view/t12.jpg` 的 f003）——要嘛再壓低葉面尺寸／靠近路徑的密度，
-   要嘛讓 tour 路徑避開藻冠；
-   (c) 葉片本身的質感（無葉緣鋸齒、無沿葉色相漸層，近看仍像平滑卡片）。
-2. **圖片通道**：已恢復（11-26 起可讀 ≤960 寬 JPEG）。本輪讀 8 張（`diag12`、`f1–f5`、
-   一張 960×540 單圖、`c10.jpg`），合計約 0.9 MB，沒有再出現 `media omitted`。
-   額度規則見 §1：一個任務的圖片總量有上限，能用數值工具就不要看圖。
-3. **`npm test` 還不存在**：`package.json` 沒有 `test` script，計畫 §2.6 的 `tests/verify.js`
-   （TAP：單一檔自含、體積 budget、無 console error、`__scene.ready`、6 poses 可切換、canvas 非空白）
-   尚未寫，所以環境驗收現在恆為 `npm error Missing script: "test"`。WP9 前要補上。
+1. **Visual critic：停止條件已達成**（0 blocker、0 major，critic 清單上的 minor 全數收完；見 §2.1 第 4、5 輪）。
+   最終覆核：`_rev13`（6 poses @1920×1080 **＋** tour 12 s／12 格）與 `_rev13p`（同場景 PNG，供數值工具），
+   覆核圖 `_view/c13.jpg`；`scan.js` 六格 0 blobs、`chromaMean` pose0 0.1452 / pose2 0.1119、所有 run `errors: []`。
+   剩下的都不是缺陷而是取捨，若要再動只這一項有意義：tour 裡「貼著葉面飛」的平淡格（`_view/g6.jpg` 的 f004 型）——
+   要嘛讓 tour 路徑繞開藻冠（改 `tourSample` 的 y／偏移），要嘛接受它為穿越林相的過場鏡頭。
+2. **圖片通道**：已恢復（11-26 起可讀 ≤960 寬 JPEG）。整個任務讀了 12 張
+   （`diag12`、`f1–f5`、`c10`、`g5`、`g6`、`g7` 兩次、`c13`），合計約 1.3 MB，沒有再出現 `media omitted`。
+   額度規則見 §1：一個任務的圖片總量有上限，能用數值工具（`region.js`／`chroma.js`／`scan.js`）就不要看圖。
+3. **`npm test` 已上線**（§2.4）：`tests/verify.js` 17 項斷言全綠、`exit 0`，
+   且用 `exposure=0` 的副本做過反向驗證（3 項 `not ok`、`exit 1`）→ 不是恒綠的假測試。
 
 **P1 — 規格符合度**
 3. **深度階梯的肉眼確認**：規格要「表層 cyan → 遠處 deep blue」。數值上 pose5(0.247) 明顯暗於
    pose0(0.47)，但中間距離是否仍偏 milky 需要看圖。
-4. **1920×1200 重測**：現有 1200p 數字（avg 6.82 / p99 16.8 / max 22.2）是在
-   god ray 加固與海面法線改寫之前測的，要重跑並補進報告。
-5. **0.1% low 尾端**：max 33.4 ms 落在規格容許的 27–37 ms 內，但 p999 14.1 ms 需在新版再確認一次。
+4. **1920×1200 重測：已完成**（本輪，見 §2.2 的 `_perf1200` / `_perf1200n` / `_perf1200b` 三列）。
+   新 kelp／舷帶之下 wall avg 8.0–8.5 ms（開 vsync）、關 vsync 7.82 ms 且 p99 12.6 / max 17.0，
+   gpuMs avg 7.0–7.6 / p99 ≤ 12.3 → 規格 WP7 的 avg 11–16 ms 有充分餘裕。
+5. **0.1% low 尾端：已確認**。關 vsync 的 20 s run 是 p999 14.2 ms / max 17.0 ms、0.1% low 58.8 fps；
+   開 vsync 的 p999 22 ms 是 60→30 fps 的跳格（vsync 週期），不是場景突然變慢。
 6. **timestamp query**：要不要把 per-pass 計時正式定位成「submit-fence 量測」並寫進交付報告
    （或改用 `__scene` 的 `ts=1` 路徑等真 Chrome）。
 
 **P2 — 打磨**
-7. 巨藻葉片形狀／寬度／密度：第 4 輪已加節理＋pneumatocyst＋更長的葉帶，近距離仍偏「平滑」（無葉緣鋸齒、無沿葉色相漸層）。
+7. 巨藻葉片形狀：**第 5 輪已做**（葉緣鋸齒 ×2 頻率、中肋、canopy 金綠漸層、節理與氣囊）。
+   若還要更寫實，剩下的只有「葉面局部破洞／附著生」這類微細節，CP 值低。
 8. 魚群已入鏡（pose0/2/4 皆可見）；蝠鱝與氣泡在 pose 內的辨識度尚未逐格確認。
 9. pose1 直視太陽時的 bloom/clip 與天空漸層 banding。
 10. 交付前清掉暫存目錄：`_rev*`、`_shots*`、`_view`、`_critic*`、`_perf*`。
@@ -254,6 +296,7 @@ juvenile 0.17→0.24，第 4 輪再加每株約 270 個氣囊頂點 ≈ +39% kel
 |---|---|---|
 | `cdp.js` | 共用函式庫：啟動 headless Edge（真 GPU）、開頁、eval、screenshot、事件收集；指令逾時 30 s、總預算 180 s、斷線即失敗（見上節）。其他工具都 require 它 | `const {launch}=require('./tools/cdp.js')` |
 | `check.js` | 語法檢查 inline script + 回報 raw/minified/gzip 體積 | `node tools\check.js` |
+| `tests/verify.js`（`npm test`） | 交付驗收：TAP 13、17 項斷言（自含、體積、WebGPU device、幀推進、零外部請求、6 poses 切相機、errors 空、畫面非空白） | `npm.cmd test`；反向驗證 `node tests\verify.js _neg\blank.html`；`VERIFY_SIZE=1280x720`、`VERIFY_KEEP=1` |
 | `shoot.js` | 主力驗證：6 個 critic poses 截圖、scripted fly-through、per-frame log | 見下方三例 |
 | `perf.js` | 讀 `frame-log.json`/`tour-stats.json`，印 avg/percentiles/最差幀/直方圖 | `node tools\perf.js _perf6` |
 | `scan.js` | 找黑塊（NaN 黑卡偵測），輸出 bbox 與平均 RGB | `node tools\scan.js _rev8\pose0-canyon-start.png 18 400` |
@@ -261,7 +304,7 @@ juvenile 0.17→0.24，第 4 輪再加每株約 270 個氣囊頂點 ≈ +39% kel
 | `region.js` | 區域統計：mean/std/edge/clip，證明某區域有結構不是平 wash | `node tools\region.js _rev8\pose1-look-up-surface.png 0 0 1 0.4` |
 | `png.js` | PNG decoder + 全圖統計（mean、max、darkPct、clipPct、stripe） | `node tools\png.js _rev8\pose0-canyon-start.png` |
 | `ascii.js` | 文字預覽（亮度 ASCII 圖 + 顏色提示字元），沒有圖片通道時用 | `node tools\ascii.js _rev8\pose3-fluke-garden.png 74` |
-| `crop.js` | 純 Node 裁剪/放大 PNG → 新 PNG（看細節用） | `node tools\crop.js in.png 440 190 400 300 1 out.png` |
+| `crop.js` | 純 Node 裁剪/放大 PNG → 新 PNG（看細節用）；**scale 建議整數**，第 5 輪已修掉非整數寬度導致瀏覽器解出黑 tile 的問題 | `node tools\crop.js in.png 440 190 400 300 1 out.png` |
 | `sheet.js` | 用瀏覽器把多張圖排成帶標籤的 contact sheet（JPG） | `node tools\sheet.js --out _view\g1.jpg --cols 3 --w 1080 _rev8\pose0*.png ...` |
 | `montage.js` | 純 Node 版 contact sheet（輸出 PNG，不啟動瀏覽器） | `node tools\montage.js _view\m.png --cols 3 --w 480 a.png b.png` |
 | `dbg.js` | 頁面內除错：依序執行 `--eval` / `--shot`，最後印 ERRORS/cam/stats | `node tools\dbg.js --param "hide=snow,bub" --eval "__scene.setPose(3)" --shot _shots\a.png` |
@@ -301,14 +344,17 @@ node tools\dbg.js --param "hide=kelp,props" --eval "__scene.setPose(0)" --shot _
 ---
 
 ## 5. 下一步（順序）
-1. 修 §2.1 `_rev10` 的 major #1：pose4 `kelp-corridor` 洗白無主體 —
-   先試 `shoot.js --q "gr=0.55"` 確認是光柱還是 in-scatter，再決定改 pose4 的 yaw/pitch
-   （看向岩壁或拱門）或逆陽時壓 `shaft`。驗收：`shoot.js --poses 4 --fmt jpeg` + `region.js`。
-2. 修 major #2：iridescent 巨藻葉的洋紅依深度往霧色插值 + 降飽和（比照 bed 的 `gcCool` 作法），
-   目標是畫面裡最高飽和的物體回到冷調range。驗收：`--poses 0,2`。
-3. 收 minor #3/#5：莖加直徑抖動與葉柄氣囊、视点空地 10 m 再外推（`placeFlora.onStage`）。
-4. 收 minor #4/#6：船殼肋骨加大或 pose2 再靠近；魚群/氣泡移進 pose 視野。
-5. 重跑 6 poses @1920×1080（`_rev11`）+ tour 截圖序列，直到沒有 major。
-6. 重測 1920×1200（`--perf` 與 `--profile`，新 kelp 幾何），把 avg / p99 / max 寫進 `docs/reports/perf.md`。
-7. 補 `tests/verify.js` + `npm test`（WP9，環境驗收現在是 Missing script），
-   清理暫存目錄（`_fix*`、`_rev*`、`_diag`、`_t_cdp`），交付 `index.html` + 體積 + 效能報告 + critic 最終評語。
+
+第 3–5 輪的 critic 清單、1200p 重測與 `npm test` 都已結清，剩下的是交付動作與一個可選鏡頭：
+
+1. **交付前清暫存目錄**（`_rev*`、`_fix*`、`_perf*`、`_diag`、`_t_*`、`_view`、`_test`，全在 `.gitignore` 的 `_*/` 內）：
+   `Get-ChildItem -Directory -Filter '_*' | Remove-Item -Recurse -Force`（先確認沒有要留的覆核圖，
+   或先把 `_view/*.jpg` 裡想留的几张搬進 `docs/images/`）。
+2. **交付三件套**（計畫 WP9）：`index.html`（135.6 KiB raw / 93.1 KiB min / 32.9 KiB gzip）
+   ＋ 效能報告（本檔 §2.2，含 1200p 三列）＋ critic 最終評語（本檔 §2.1 第 5 輪表與 `_rev13` 判定）。
+   若要獨立成檔，從 §2.2／§2.1 拆出 `docs/reports/perf.md`、`docs/reports/critic.md` 即可，不必重跑量測。
+3. **可選（唯一還有感的視覺項目）**：讓 tour 路徑繞開藻冠——`tourSample()` 的高度／橫向偏移加一點
+   與 `canyonCenter` 的相位差，避開 `placeFlora` 最密的環帶；驗收方式是
+   `node tools\shoot.js --size 1280x720 --poses none --tour 12 --tour-frames 12 --out _tour2`
+   再用 `region.js` 逐格看 edge（現況 mean 0.0437／min 0.0249）。
+4. **可選**：蝠鱝與氣泡在 pose 內的逐格辨識度（P2 #8）、pose1 天空漸層 banding 的 PNG 複查（P2 #9）。
