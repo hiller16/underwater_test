@@ -25,6 +25,13 @@ const warm = parseInt(one('--warm', '2500'), 10);
 const fmt = one('--fmt', 'png');
 const extraFlags = one('--flags', '').split(' ').filter(Boolean);
 const extraQ = one('--q', '');
+// Total time cap for the run (enforced by cdp.js): fixed overhead plus everything
+// asked for, so a legitimate long tour survives but a hung browser gets killed.
+// Override with --budget <seconds>.
+const budgetSec = parseInt(one('--budget', '0'), 10);
+const budgetMs = budgetSec > 0 ? budgetSec * 1000
+  : 60000 + (tourSec > 0 ? Math.round(tourSec * 1000) + warm : 0) +
+    poses.length * (settle + 12000) + (tourFrames > 0 ? tourFrames * 2500 : 0);
 const mode = (flag('--profile') ? '&profile=1' : (flag('--perf') ? '&perf=1' : '')) +
              (extraQ ? '&' + extraQ : '');
 
@@ -32,7 +39,7 @@ const mode = (flag('--profile') ? '&profile=1' : (flag('--perf') ? '&perf=1' : '
   fs.mkdirSync(outDir, { recursive: true });
   const flags = extraFlags.slice();
   if (flag('--nolimit')) flags.push('--disable-frame-rate-limit', '--disable-gpu-vsync');
-  const b = await launch({ width: W, height: H, flags });
+  const b = await launch({ width: W, height: H, flags, budgetMs, budgetLabel: 'shoot.js' });
   const summary = { size: [W, H], shots: [], errors: [], perf: null, tourStats: null };
   try {
     await b.open(file + '?noinfo=1' + mode + (one('--param', '') ? '&' + one('--param', '') : ''), 400);

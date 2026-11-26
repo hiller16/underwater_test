@@ -31,6 +31,29 @@
   `fogBlend()` 內 `select()` 防毒 fallback、mote 的 `discard` 閘門與近鏡剔除。
 - 驗證 API `window.__scene`：`setPose / startTour / resetStats / getStats / hide / luma / sheet`。
 
+### 驗證工具強化（本輪，2026-11-26）
+`.clinerules/workflow.md` §2 要求的逾時保護已補進 `tools/cdp.js`（其他瀏覽器工具都 require 它，自動適用）：
+
+- **每條 CDP 指令 30 s 逾時**（`CDP_CMD_TIMEOUT_MS` 覆寫），錯誤訊息帶 method 名稱。
+- **WebSocket `close`／`error` 時一次讓所有 in-flight 指令失敗**；`b.close()` 冪等，`b.pending()` 可看還在等什麼。
+- **整體時間預算 180 s**（`CDP_BUDGET_MS`）：由第一次 `launch()` 啟動、之後共用同一條截止線
+  （所以 `tsflag.js` 那種連續開 6 個瀏覽器的工具也算總量）；到點 `taskkill /T /F` 整棵行程樹
+  + `exit 1`，並印出還在等的 CDP 指令。計時器 unref → 正常跑完不會多撐時間。
+- 啟動階段同樣封頂：等 `DevToolsActivePort` 60 s（`CDP_BOOT_TIMEOUT_MS`）、`/json/list` 與 WS 連線各 30 s；
+  `process.on('exit')` 兜底掃掉沒 `close()` 的 Edge。
+- `shoot.js` 依工作量推算預算：`60 s + tour + warm + poses×(settle+12 s) + tour-frames×2.5 s`，可用 `--budget <sec>` 覆寫。
+
+實測（暫存目錄 `_t_cdp`，已刪）：
+
+| 情境 | 結果 |
+|---|---|
+| 正常：1 pose @854×480 | 2 s 完成，exit 0，errors `[]` |
+| 正常：tour 6 s + 4 張截圖 @1280×720 | 11 s 完成，exit 0，avg 5.56 ms |
+| 卡住：`eval new Promise(()=>{})`，`CDP_CMD_TIMEOUT_MS=3000` | `ERR CDP Runtime.evaluate timed out after 3 s`，工具繼續跑完，exit 0 |
+| 卡住：30 s 的 eval + `CDP_BUDGET_MS=6000` | `TIMEOUT: tool run exceeded 6 s (waiting on CDP: Runtime.evaluate for 3s) - browser killed`，exit 1 |
+| 指令進行中殺掉 Edge | 等待中的 eval 1.7 s 內以 `CDP socket error` 失敗（而不是等 30 s） |
+| 未捕獲的 rejection | exit 1，Edge 在約 2 s 內完全消失（taskkill 已發出，OS 收尾需要一點時間） |
+
 ### 本輪修掉的缺陷
 | 缺陷 | 根因 | 處置 | 驗證 |
 |---|---|---|---|
@@ -112,9 +135,16 @@ GPU 端（`gpuMs`，同一 submit 的 fence 往返）：1080p avg 5.7 / p99 8.9 
    由「只看圖」的 critic 判定；目標是没有任何項目高於 minor。
    重點複核：船殼/鯨尾可辨识度、god ray 強度（要明顯但不把中間調洗白）、
    近距離巨藻葉片過大過平、紫色地面飽和度、banding。
-2. **圖片通道失效**：本 session `read_files` 讀 PNG/JPG 一律 `media omitted`
-   （378 KB～1 MB 都試過，舊檔也一樣）。肉眼覆核被迫暫停，
-   目前靠 `ascii.js / region.js / scan.js` 撐住組合與數值判斷。
+2. **圖片通道**：上一輪 session `read_files` 讀 PNG/JPG 一律 `media omitted`
+   （378 KB～1 MB 都試過，舊檔也一樣），肉眼覆核被迫暫停，
+   當時靠 `ascii.js / region.js / scan.js` 撐住組合與數值判斷。
+   → 本輪（11-26 10:53，新任務）讀 `_t_cdp/pose0-canyon-start.jpg`（854×480、74 KB）成功，
+   通道已恢復；但仍要守 §1 的額度規則（只讀 ≤960 寬 JPEG、多張用 `sheet.js` 拼一張）。
+   順帶記錄那張 854×480 pose0 的初判：中間偏右的霧＋光柱仍偏 milky、近距離巨藻葉片是硬邊扁片、
+   遠處莖過細像掃把柄（對應待辦 P2-7）。
+3. **`npm test` 還不存在**：`package.json` 沒有 `test` script，計畫 §2.6 的 `tests/verify.js`
+   （TAP：單一檔自含、體積 budget、無 console error、`__scene.ready`、6 poses 可切換、canvas 非空白）
+   尚未寫，所以環境驗收現在恆為 `npm error Missing script: "test"`。WP9 前要補上。
 
 **P1 — 規格符合度**
 3. **深度階梯的肉眼確認**：規格要「表層 cyan → 遠處 deep blue」。數值上 pose5(0.247) 明顯暗於
@@ -140,7 +170,7 @@ GPU 端（`gpuMs`，同一 submit 的 fence 往返）：1080p avg 5.7 / p99 8.9 
 
 | 工具 | 用途 | 範例 |
 |---|---|---|
-| `cdp.js` | 共用函式庫：啟動 headless Edge（真 GPU）、開頁、eval、screenshot、事件收集。其他工具都 require 它 | `const {launch}=require('./tools/cdp.js')` |
+| `cdp.js` | 共用函式庫：啟動 headless Edge（真 GPU）、開頁、eval、screenshot、事件收集；指令逾時 30 s、總預算 180 s、斷線即失敗（見上節）。其他工具都 require 它 | `const {launch}=require('./tools/cdp.js')` |
 | `check.js` | 語法檢查 inline script + 回報 raw/minified/gzip 體積 | `node tools\check.js` |
 | `shoot.js` | 主力驗證：6 個 critic poses 截圖、scripted fly-through、per-frame log | 見下方三例 |
 | `perf.js` | 讀 `frame-log.json`/`tour-stats.json`，印 avg/percentiles/最差幀/直方圖 | `node tools\perf.js _perf6` |
@@ -179,8 +209,11 @@ node tools\dbg.js --param "hide=kelp,props" --eval "__scene.setPose(0)" --shot _
 ```
 
 `shoot.js` 其他旗標：`--file`、`--poses 0,2,4`（`none` = 不截圖）、`--flags "--a --b"`、
-`--q "exposure=1.2&gr=1.4"`（直接覆寫 `CFG`）、`--warm 2500`（先暖機再開始計時）、`--hud`。
+`--q "exposure=1.2&gr=1.4"`（直接覆寫 `CFG`）、`--warm 2500`（先暖機再開始計時）、`--hud`、
+`--budget 240`（整體時間上限，秒；預設依工作量推算，見上節）。
 環境變數（`dbg.js`）：`PAGE`、`VW`、`VH`、`FLAGS`。
+環境變數（`cdp.js`，全部工具通用）：`CDP_CMD_TIMEOUT_MS`（單條指令，預設 30000）、
+`CDP_BOOT_TIMEOUT_MS`（開瀏覽器，預設 60000）、`CDP_BUDGET_MS`（整體，預設 180000）。
 
 ---
 
