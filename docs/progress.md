@@ -449,7 +449,13 @@ node tools\dbg.js --param "hide=kelp,props" --eval "__scene.setPose(0)" --shot _
    - per-pass 計時要不要正式定位成「submit-fence 量測」寫進報告（P1 #6）——**報告 `perf.md` §5 已這樣寫**。
    - ~~氣泡逐格辨識度（P2 #8 剩餘）~~ **第 8 輪已做**：精靈半徑 ×1.85、環形對氣泡軟化，
      逐格貢獻 0.14–0.32 % → **0.46–1.02 %**（見 §2.1 第 8 輪）。至此 §3 的清單全數結清。
-4. **接手必讀**：本檔 §4（工具怎么用）＋ §1 缺陷表最後五列——
+4. **遠端 repo**：**已建並推送（2026-11-26）**——private repo `underwater_test`，
+   `origin = https://github.com/hiller16/underwater_test.git`，預設分支 `main`；
+   伺服器端 `refs/heads/main` = 本地 `HEAD` = `fee1fc0`，27 個 commit／34 個檔案全部推上，
+   最大檔 `index.html` 135.8 KiB（`_*/` 與 `node_modules/` 由 `.gitignore` 排除，不會被推上去）。
+   之後推檔只用 `git push`；`gh` 不在 PATH，要用 `& 'C:\Program Files\GitHub CLI\gh.exe'`，
+   且 PowerShell 5.1 會把 `git push` 寫到 stderr 的正常訊息當成錯誤（結束碼 1），要另查 `git ls-remote`。
+5. **接手必讀**：本檔 §4（工具怎么用）＋ §1 缺陷表最後五列——
    WGSL 不支援巢狀三元運算子（整個 shader 解析失敗、整組道具消失）、
    `crop.js` 非整數 scale 會解出黑 tile、`verify.js` 的 rAF 斷言要抗 GPU 搶佔、
    PowerShell 單引號不脫字（`--eval '__scene.hide(\"bub\")'` 會靜默拋錯，圖層 A/B 改用 URL 參數）、
