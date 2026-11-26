@@ -1153,10 +1153,11 @@ function buildKelpMesh(rng) {
   const verts = [], idx = [];
   let vi = 0;
   const push = (x, y, z, nx, ny, nz, u, v) => { verts.push(x, y, z, nx, ny, nz, u, v); };
-  // stipe: thin faceted column, tapering up
+  // stipe: a substantial faceted column, tapering up. In radius units 0.15 at the base
+  // is roughly a 0.5 m stalk - anything thinner reads as a pole, not a plant.
   const S = 4, SR = 8;
   for (let j = 0; j <= SR; j++) {
-    const v = j / SR, r = 0.075 * (1 - 0.55 * v) + 0.012;
+    const v = j / SR, r = 0.15 * (1 - 0.62 * v) + 0.02;
     for (let i = 0; i <= S; i++) {
       const a = (i / S) * 6.2831853, ca = Math.cos(a), sa = Math.sin(a);
       push(ca * r, v, sa * r, ca, 0.1, sa, i / S, v);
@@ -1171,25 +1172,25 @@ function buildKelpMesh(rng) {
   // and float upward, which is what opens the understory up for the camera to fly
   // through. Radial extents are in "radius units" (the VS multiplies by the instance
   // radius, 2.4-4.0, so 1 unit ~ 3 m); y is a fraction of the 25-60 m stalk height.
-  const nodes = CFG.kelpNodes, ROWS = 5;
+  const nodes = CFG.kelpNodes, ROWS = 6;
   for (let nd = 0; nd < nodes; nd++) {
-    const t0 = 0.52 + 0.46 * Math.pow(nd / (nodes - 1), 0.8);    // bare column, leafy crown
-    const crown = 1 + 0.55 * smoothstep(0.60, 1.0, t0);
-    const perNode = t0 > 0.58 ? 3 : 2;
+    const t0 = 0.48 + 0.52 * Math.pow(nd / (nodes - 1), 0.75);   // bare column, leafy crown
+    const crown = 1 + 0.60 * smoothstep(0.62, 1.0, t0);
+    const perNode = t0 > 0.72 ? 4 : (t0 > 0.58 ? 3 : 2);
     for (let k = 0; k < perNode; k++) {
       const ang = nd * 2.399963 + k * (6.2831853 / perNode) + (rng() - 0.5) * 0.55;
       const ca = Math.cos(ang), sa = Math.sin(ang), tx = -sa, tz = ca;
-      const len = (1.02 + 0.46 * rng()) * crown;
-      const wid = (0.17 + 0.09 * rng()) * (0.85 + 0.25 * crown);
+      const len = (1.25 + 0.55 * rng()) * crown;   // streaming fronds, not leaves
+      const wid = (0.26 + 0.12 * rng()) * (0.85 + 0.25 * crown);
       const v0 = clamp(t0 - 0.03 + 0.03 * rng(), 0, 0.96);
-      const rise = 0.026 + 0.022 * rng();        // fronds float up toward the surface
-      const droop = 0.008 + 0.014 * rng();       // ... easing off near the tip
+      const rise = 0.030 + 0.024 * rng();        // fronds float up toward the surface
+      const droop = 0.006 + 0.010 * rng();       // ... easing off near the tip
       const twist = (rng() - 0.5) * 0.9;         // ribbon twist along the length
-      const off = 0.05;
+      const off = 0.09;                          // clear of the thicker stipe
       for (let j = 0; j <= ROWS; j++) {
         const t = j / ROWS;
         const rad = off + len * t;
-        const w = wid * Math.sin(Math.PI * Math.min(1, 0.18 + t * 0.9)) * (1 - 0.42 * t);
+        const w = wid * Math.sin(Math.PI * Math.min(1, 0.14 + t * 0.92)) * (1 - 0.34 * t);
         const y = v0 + rise * t - droop * Math.pow(t, 2.2);
         const px = ca * rad, pz = sa * rad;
         const roll = twist * t;                  // roll the ribbon about its own axis
@@ -1263,7 +1264,7 @@ function placeFlora(rng) {
       const room = CFG.surfaceY - bed - 7;
       if (room < 16) continue;
       let h = room * (0.80 + 0.20 * rng());      // canopy just under the surface
-      if (rng() < 0.17) h *= 0.42 + 0.28 * rng(); // juveniles give the forest layers
+      if (rng() < 0.24) h *= 0.40 + 0.30 * rng(); // juveniles give the forest layers
       if (h < 12) continue;
       const o = n * 12;
       out[o + 0] = xx; out[o + 1] = bed - 0.6; out[o + 2] = zz; out[o + 3] = h;
