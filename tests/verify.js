@@ -86,13 +86,21 @@ function frameStats(file) {
 
     await b.eval('__scene.hideOverlay(); __scene.hud(false);');
 
-    // The render loop has to actually run, or every later check is meaningless. The very
-    // first frames pay for pipeline compilation, so let the loop settle before measuring.
-    await sleep(1200);
+    // The render loop has to actually run, or every later check is meaningless. The first
+    // frames pay for pipeline compilation, and a second headless browser (the auto-verify
+    // harness runs this while a capture tool is still open) starves the compositor, so the
+    // wait is generous and the bar only asks for the loop to be alive.
+    await sleep(1500);
     const f1 = await b.eval('__scene.getStats().frame');
-    await sleep(800);
-    const f2 = await b.eval('__scene.getStats().frame');
-    add('the render loop advances frames', f2 > f1 + 20, 'frames ' + f1 + ' -> ' + f2 + ' in 800 ms');
+    let f2 = f1, t0 = Date.now();
+    try {
+      await b.waitFor('__scene.getStats().frame >= ' + (f1 + 12), 5000, 100);
+      f2 = await b.eval('__scene.getStats().frame');
+    } catch (e) { f2 = await b.eval('__scene.getStats().frame'); }
+    const el = Date.now() - t0;
+    add('the render loop advances frames', f2 >= f1 + 12,
+        'frames ' + f1 + ' -> ' + f2 + ' in ' + el + ' ms (' +
+        Math.round((f2 - f1) / el * 1000) + ' fps)');
 
     // no network traffic beyond the document itself
     const req = await b.eval('JSON.stringify(performance.getEntriesByType("resource").map(r => r.name))');

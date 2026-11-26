@@ -84,6 +84,8 @@ const CFG = {
   vignette: 0.34,
   density: qp('density', 1),          // instance-count multiplier
   diag: qp('diag', 0),                // 1 = composite shows the NaN map
+  time: qp('time', -1),               // >= 0 pins the clock: frames become reproducible,
+                                      // which is what tools/diff.js needs to isolate a layer
 };
 { // URL overrides for tuning during the critic loop
   const o = { exposure: 'exposure', sunIntensity: 'sun', causticStrength: 'caustic',
@@ -968,10 +970,13 @@ fn wrapBox(p : vec3<f32>, cam : vec3<f32>, size : vec3<f32>) -> vec3<f32> {
   let ph = i1.x; let spd = i2.x;
   let a = t * spd + ph * 6.2831;
   let rr = i2.y;
-  let climb = 9.0 * sin(a * 0.47 + ph * 2.2);
+  // Climb amplitude is per instance: a ray parked in front of a viewpoint hovers, while
+  // a roaming one rolls through the full height of its circuit.
+  let climbA = i2.w;
+  let climb = climbA * sin(a * 0.47 + ph * 2.2);
   var wp = i0.xyz + vec3<f32>(cos(a) * rr, climb + i1.z, sin(a) * rr);
   wp.y = min(wp.y, u.camBasis.z - 12.0);
-  let fwd = normalize(vec3<f32>(-sin(a) * rr, 9.0 * 0.47 * cos(a * 0.47 + ph * 2.2), cos(a) * rr));
+  let fwd = normalize(vec3<f32>(-sin(a) * rr, climbA * 0.47 * cos(a * 0.47 + ph * 2.2), cos(a) * rr));
   let rt0 = normalize(cross(vec3<f32>(0.0, 1.0, 0.0), fwd));
   // bank into the turn, then flap the wings about the span axis
   let bank = -0.42;
@@ -1929,8 +1934,9 @@ function placeLife(rng) {
     }
   }
   out.fish = fish; out.fishN = SCH * PER;
-  // manta rays on slow circuits. A circuit that crosses the camera corridor is retried:
-  // a 9 m wingtip sweeping through the lens reads as a black slab, not as scale.
+  // Manta rays on slow circuits. A circuit 34-74 m across never enters a critic frame, so
+  // one ray per viewpoint is parked in front of it: without something large and alive in
+  // the middle distance the scene reads as a still life however good the water is.
   const MN = 8;
   const orbitClear = (x, y, z, rr) => {
     for (let k = 0; k < 16; k++) {
@@ -1942,17 +1948,49 @@ function placeLife(rng) {
     return true;
   };
   out.manta = pack(MN, (a, o, i, r) => {
-    let x = 0, y = 0, z = 0, rr = 40, ok = false;
-    for (let att = 0; att < 10 && !ok; att++) {
-      z = (r() * 2 - 1) * (half - 40);
-      x = canyonCenter(z) + (r() * 2 - 1) * 40;
-      y = clamp(bedHeight(x, z) + 26 + r() * 26, -18, CFG.surfaceY - 30);
-      rr = 34 + 40 * r();
-      ok = orbitClear(x, y, z, rr);
+    const parked = i < POSES.length;
+    let x = 0, y = 0, z = 0, rr = 40, ph = r(), lift = (r() - 0.5) * 8, climbA = 9;
+    if (parked) {
+      const p = POSES[i];
+      const fx = Math.sin(p.yaw), fz = -Math.cos(p.yaw);
+      const sx = Math.cos(p.yaw), sz = Math.sin(p.yaw);
+      // Sit the animal on the view axis itself - setPose lifts the eye to bed + 14 and the
+      // pitch is signed, so even a downward-looking pose keeps the ray framed. Then ask the
+      // terrain: a ledge or a wall at that spot would either shove the height guard out of
+      // frame or swallow the ray, so retry until the water column is deep enough.
+      const eye = Math.max(p.y, bedHeight(p.x, p.z) + 14);
+      const pitch = clamp(p.pitch || 0, -1.05, 1.05);
+      let ok2 = false;
+      for (let att = 0; att < 8 && !ok2; att++) {
+        const dd = 24 + 10 * r(), side = (i % 2 ? -1 : 1) * (3 + 6 * r());
+        x = p.x + fx * dd + sx * side; z = p.z + fz * dd + sz * side;
+        y = eye + dd * Math.tan(pitch) + (r() - 0.5) * 5;
+        ok2 = y > bedHeight(x, z) + 16 && y < CFG.surfaceY - 18;
+      }
+      y = clamp(y, bedHeight(x, z) + 10, CFG.surfaceY - 16);
+      // Close enough to read as an animal (a 5 m ray at 45 m is a smudge), and a small
+      // slow circle so it stays in frame instead of wandering out of shot.
+      rr = 4 + 5 * r();
+      // start the circuit on the side facing the lens, so the ray is on screen rather
+      // than behind the ridge at the moment the pose is captured
+      ph = Math.atan2(p.z - z, p.x - x) / 6.2831;
+      lift = 0;
+      climbA = 2.5 + 1.5 * r();              // hover, do not roll out of frame
+    } else {
+      let ok = false;
+      for (let att = 0; att < 10 && !ok; att++) {
+        z = (r() * 2 - 1) * (half - 40);
+        x = canyonCenter(z) + (r() * 2 - 1) * 40;
+        y = clamp(bedHeight(x, z) + 26 + r() * 26, -18, CFG.surfaceY - 30);
+        rr = 34 + 40 * r();
+        ok = orbitClear(x, y, z, rr);
+      }
     }
-    a[o] = x; a[o + 1] = y; a[o + 2] = z; a[o + 3] = 2.2 + 2.6 * r();
-    a[o + 4] = r(); a[o + 5] = r(); a[o + 6] = (r() - 0.5) * 8; a[o + 7] = 0;
-    a[o + 8] = 0.030 + 0.036 * r(); a[o + 9] = rr; a[o + 10] = r(); a[o + 11] = 0;
+    a[o] = x; a[o + 1] = y; a[o + 2] = z;
+    a[o + 3] = parked ? 3.4 + 1.6 * r() : 2.2 + 2.6 * r();   // span 6.8-10 m in frame
+    a[o + 4] = ph; a[o + 5] = r(); a[o + 6] = lift; a[o + 7] = 0;
+    a[o + 8] = parked ? 0.020 + 0.020 * r() : 0.030 + 0.036 * r();
+    a[o + 9] = rr; a[o + 10] = r(); a[o + 11] = climbA;
   });
   out.mantaN = MN;
   return out;
@@ -2574,8 +2612,11 @@ async function renderProfile() {
 // ---------------- frame loop ----------------
 let RUNNING = false, rafId = 0, lastNow = 0, hudLast = 0, gpuLast = 0;
 function stepFrame(cpuMs) {
-  const dt = Math.min(0.05, cpuMs * 0.001);
-  R.time += dt; R.frame++;
+  // ?time=<sec> pins the clock: dt becomes 0, so the camera, the sway, the caustics and
+  // the snow all stand still and two screenshots of the same setup are pixel-identical.
+  const dt = CFG.time >= 0 ? 0 : Math.min(0.05, cpuMs * 0.001);
+  R.time = CFG.time >= 0 ? CFG.time : R.time + dt;
+  R.frame++;
   if (tour.on) tour.t += dt;
   updateCamera(dt);
   writeUniforms();
