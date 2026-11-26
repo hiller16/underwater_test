@@ -200,7 +200,7 @@ juvenile 0.17→0.24，第 4 輪再加每株約 270 個氣囊頂點 ≈ +39% kel
 或支援 inside-passes 的 build 上才會出現。
 
 ### 2.3 體積
-`node tools/check.js` → **raw 132.8 KiB | minified 92.0 KiB | gzip 32.4 KiB**（單檔，無外部資源）。
+`node tools/check.js` → **raw 133.2 KiB | minified 92.1 KiB | gzip 32.4 KiB**（單檔，無外部資源）。
 
 ### 2.4 驗證環境
 - 本機即目標硬體（Ryzen AI Max+ 395 / Radeon 8060S，Windows 11）。
