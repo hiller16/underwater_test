@@ -77,6 +77,7 @@ const CFG = {
   contrast: 0.42,
   causticStrength: 0.95,
   godrayStrength: 0.86,
+  godrayShaft: 0.62,          // shaft-only gain: beams without the veiling
   godrayDecay: 0.955,
   bloomThreshold: 1.55,
   bloomIntensity: 0.64,
@@ -86,7 +87,8 @@ const CFG = {
 };
 { // URL overrides for tuning during the critic loop
   const o = { exposure: 'exposure', sunIntensity: 'sun', causticStrength: 'caustic',
-              godrayStrength: 'gr', bloomIntensity: 'bloom', vignette: 'vig', fovDeg: 'fov' };
+              godrayStrength: 'gr', godrayShaft: 'gs', bloomIntensity: 'bloom',
+              vignette: 'vig', fovDeg: 'fov' };
   for (const k in o) { if (Q.has(o[k])) CFG[k] = qp(o[k], CFG[k]); }
 }
 const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
@@ -263,7 +265,7 @@ struct U {
   params2  : vec4<f32>,   // bloomThreshold, bloomIntensity, vignette, contrast
   screen   : vec4<f32>,   // width, height, 1/w, 1/h
   params3  : vec4<f32>,   // 1/rayW, 1/rayH, ray steps, ray reach
-  params4  : vec4<f32>,   // diagnostics (1 = show NaN map), spare, spare, spare
+  params4  : vec4<f32>,   // diagnostics (1 = show NaN map), shaft gain, spare, spare
 };
 @group(0) @binding(0) var<uniform> u : U;
 
@@ -1040,8 +1042,11 @@ fn rayDirAt(uv : vec2<f32>) -> vec3<f32> {
     acc += m * exp(-t * ab * 0.6) * near * dt;
     t += dt;
   }
-  // acc is an integral in metres; the scattering coefficient turns it into radiance
-  let shaft = acc * 0.0185 * (0.32 + 1.55 * pow(sd, 2.0));
+  // acc is an integral in metres; the scattering coefficient turns it into radiance.
+  // The shaft has its own gain because the march keeps integrating through every gap in
+  // a kelp canopy - without it the beams veil the whole frame instead of reading as
+  // columns of light in front of the forest.
+  let shaft = acc * 0.0185 * (0.32 + 1.55 * pow(sd, 2.0)) * u.params4.y;
   // Small halo, defined disc: the sun should bloom as a light source instead of
   // painting a milky ceiling across the upper half of the frame.
   let sky = pow(sd, 7.0) * 0.22 + pow(sd, 115.0) * 2.7;
@@ -2165,7 +2170,7 @@ function writeUniforms() {
   F[68] = CFG.bloomThreshold; F[69] = CFG.bloomIntensity; F[70] = CFG.vignette; F[71] = CFG.contrast;
   F[72] = R.w; F[73] = R.h; F[74] = 1 / R.w; F[75] = 1 / R.h;
   F[76] = 1 / R.rayA.w; F[77] = 1 / R.rayA.h; F[78] = CFG.raySteps; F[79] = CFG.rayReach;
-  F[80] = CFG.diag; F[81] = 0; F[82] = 0; F[83] = 0;
+  F[80] = CFG.diag; F[81] = CFG.godrayShaft; F[82] = 0; F[83] = 0;
   R.device.queue.writeBuffer(R.ubo, 0, F, 0, F.length);
 }
 function updateCamera(dt) {
