@@ -787,7 +787,12 @@ fn pal(t : f32, a : vec3<f32>, b : vec3<f32>, c : vec3<f32>, d : vec3<f32>) -> v
   // close-range crackle so large rock and timber do not read as smooth balloons; it
   // fades out with distance, otherwise the hash aliases into a grey checkerboard on
   // the far canyon walls
-  alb *= mix(1.0, 0.88 + 0.24 * h31(floor(wp * 4.6) + vec3<f32>(seed * 17.0)), sstep(40.0, 10.0, dist));
+  // Timber is the one kind the critic looks at from 33 m, so its grain has to survive
+  // further out than rock does; the aliasing this buys is the same kind of sparkle that
+  // weathered oak actually has, and it costs nothing on the canyon walls.
+  var detR = 40.0;
+  if (kind > 4.5 && kind < 5.5) { detR = 72.0; }
+  alb *= mix(1.0, 0.88 + 0.24 * h31(floor(wp * 4.6) + vec3<f32>(seed * 17.0)), sstep(detR, 10.0, dist));
   // magenta encrusting cover: patchy growth that favours quiet upward faces, but with
   // a 3D boundary so it never paints a clean "pink cap" across the top of a boulder
   let cov = sstep(0.46, 0.72, fbm2(wp.xz * 0.24 + wp.y * 0.16 + seed * 3.0, 2)) * up * up;
@@ -1328,6 +1333,10 @@ function placeFlora(rng) {
       // Stalks sitting right on the camera corridor turn a fly-through into a wall of
       // flat blades. Keep some for foreground parallax, but never a thicket.
       if (!camClear(xx, zz, 3.2)) p *= 0.42;
+      // A blade reaches 4-6 m out from its stipe, so a stalk just outside the hard
+      // exclusion still sweeps across the lens. Thin that second ring as well; enough
+      // stalks survive that the fly-through keeps its foreground parallax.
+      else if (!camClear(xx, zz, 7.0)) p *= 0.68;
       if (rng() > p) continue;
       const slope = bedSlope(xx, zz);
       if (slope > 0.55) continue;
@@ -1611,6 +1620,13 @@ function buildShip(rng) {
     // Ribs read as carpentry, which is what separates a hull from a boulder; at the
     // critic standoff (~33 m) anything thinner than this disappears entirely.
     sweep(v2, idx2, u => pos(iR, Math.round(u * NP)), () => 0.34, 9, 4, false, false);
+  }
+  // Strakes: raised longitudinal bands. Ribs alone leave the shell a smooth grey wall
+  // at 33 m - the horizontal lines are what the eye resolves as planking, and geometry
+  // is the only honest way to get them here: a pattern sampled in world space slides
+  // over a hull that is yawed and listing instead of lying along the timbers.
+  for (let jS = 2; jS <= 8; jS += 2) {
+    sweep(v2, idx2, u => pos(Math.round(u * NS), jS), () => 0.13, 14, 4, false, false);
   }
   // Both ends closed with a fan: an open tube seen from the side is the reason a hull
   // can read as a curled sheet.
