@@ -429,12 +429,15 @@ node tools\dbg.js --param "hide=kelp,props" --eval "__scene.setPose(0)" --shot _
 ## 5. 下一步（順序）
 
 第 3–6 輪的 critic 清單、1200p 重測、`npm test`、banding 定案與生命體入鏡都已結清，
-剩下只有交付動作與兩個低 CP 項：
+兩個低 CP 項（第 7、8 輪）與交付動作都已結清；留在這裡給之後接手的人：
 
-1. **交付前清暫存目錄**（`_rev*`、`_fix*`、`_perf*`、`_diag`、`_t_*`、`_view`、`_test`，全在 `.gitignore` 的 `_*/` 內）：
-   `Get-ChildItem -Directory -Filter '_*' | Remove-Item -Recurse -Force`（先確認沒有要留的覆核圖，
-   或先把 `_view/*.jpg` 裡想留的几张搬進 `docs/images/`）。
-2. **交付三件套**（計畫 WP9）：**已完成**——`index.html`（138.0 KiB raw / 93.9 KiB min / 33.2 KiB gzip）
+1. **交付前清暫存目錄**：**已做（2026-11-26）**。保留 `_view`（歷輪覆核圖）與最新一輪的
+   `_bb2_on`／`_bb2_off`（氣泡 A/B）／`_perf1200d`（1200p 效能）／`_tv1`（tour A/B），共 38.9 MB；
+   其餘 87 個 `_` 目錄（423.9 MB）已刪。文件裡引用的舊 run 名稱（`_rev1`–`_rev14t`、`_perf*`、`_b0`、
+   `_poseBase`／`_poseB`、`_fix*`、`_t_*`、`_diag`）是數字的出處，都能用 §4 的指令重跑，不必留檔。
+   重跑整套覆核：`node tools\shoot.js --size 1920x1080 --out _rev15 --settle 1500`
+   ＋ `node tools\shoot.js --size 1280x720 --poses none --tour 20 --tour-frames 12 --out _rev15t`。
+2. **交付三件套**（計畫 WP9）：**已完成**——`index.html`（138.5 KiB raw / 94.1 KiB min / 33.3 KiB gzip，第 8 輪狀態）
    ＋ `docs/reports/perf.md`（環境、負載實例數、1200p/1080p 結果、per-pass、timestamp 限制、量測陷阱、重現指令）
    ＋ `docs/reports/critic.md`（方法、六輪摘要與缺陷→修法→驗證、最終判定、保留的取捨、判讀限制）。
    本檔 §2.1／§2.2 仍是原始留檔，報告是整理版；數字若要更新兩邊都要改。
@@ -446,5 +449,9 @@ node tools\dbg.js --param "hide=kelp,props" --eval "__scene.setPose(0)" --shot _
    - per-pass 計時要不要正式定位成「submit-fence 量測」寫進報告（P1 #6）——**報告 `perf.md` §5 已這樣寫**。
    - ~~氣泡逐格辨識度（P2 #8 剩餘）~~ **第 8 輪已做**：精靈半徑 ×1.85、環形對氣泡軟化，
      逐格貢獻 0.14–0.32 % → **0.46–1.02 %**（見 §2.1 第 8 輪）。至此 §3 的清單全數結清。
-4. **接手必讀**：本檔 §5（做什麼）＋ §4（工具怎么用）＋ §1 缺陷表最後三列（WGSL 不支援巢狀三元運算子、
-   `crop.js` 非整數寬度會解出黑 tile、`verify.js` 的 rAF 斷言要抗 GPU 搶佔）；改 shader 後一定看 `shoot.js` 的 `errors`。
+4. **接手必讀**：本檔 §4（工具怎么用）＋ §1 缺陷表最後五列——
+   WGSL 不支援巢狀三元運算子（整個 shader 解析失敗、整組道具消失）、
+   `crop.js` 非整數 scale 會解出黑 tile、`verify.js` 的 rAF 斷言要抗 GPU 搶佔、
+   PowerShell 單引號不脫字（`--eval '__scene.hide(\"bub\")'` 會靜默拋錯，圖層 A/B 改用 URL 參數）、
+   `diff.js` 一定要 `--mask` 遮 HUD，否則差分只看到 FPS 數字。
+   改 shader 後一定看 `shoot.js` 的 `errors`；改文件後跑 `node tools\mdcheck.js`。
