@@ -78,8 +78,8 @@ const CFG = {
   causticStrength: 0.95,
   godrayStrength: 0.86,
   godrayDecay: 0.955,
-  bloomThreshold: 1.35,
-  bloomIntensity: 0.55,
+  bloomThreshold: 1.55,
+  bloomIntensity: 0.64,
   vignette: 0.34,
   density: qp('density', 1),          // instance-count multiplier
   diag: qp('diag', 0),                // 1 = composite shows the NaN map
@@ -348,11 +348,14 @@ fn waterInscat(midPos : vec3<f32>, dir : vec3<f32>, shaft : f32) -> vec3<f32> {
   let depth = max(u.camBasis.z - midPos.y, 0.0);
   let tint = waterTint(depth);
   let sd = max(dot(dir, u.sunDir.xyz), 0.0);
-  let ph = 0.08 + 0.34 * pow(sd, 5.0) + 1.30 * pow(sd, 70.0);
+  // Wider, weaker forward lobe: the haze has to stay under the tonemapper's shoulder,
+  // otherwise the whole upper half clips to white and the depth gradient disappears.
+  // The sun itself is handed to the ray pass, which blooms instead of veiling.
+  let ph = 0.07 + 0.24 * pow(sd, 4.0) + 0.52 * pow(sd, 34.0);
   // sunlight only reaches the upper part of the water column, so the haze towards the
   // floor is blue-black: that is what gives the canyon its depth.
   let sunReach = 0.22 + 0.78 * exp(-depth * 0.022);
-  return tint * (u.params0.z * 0.55) + u.sunColor.rgb * (u.sunDir.w * 0.070 * ph * sunReach) * (1.0 + shaft * 1.6);
+  return tint * (u.params0.z * 0.46) + u.sunColor.rgb * (u.sunDir.w * 0.062 * ph * sunReach) * (1.0 + shaft * 1.6);
 }
 // Beer-Lambert absorption + integrated in-scatter. The haze is deliberately darker
 // than sunlit rock near the camera so distance reads as cyan -> deep blue.
@@ -763,7 +766,7 @@ fn pal(t : f32, a : vec3<f32>, b : vec3<f32>, c : vec3<f32>, d : vec3<f32>) -> v
   // close-range crackle so large rock and timber do not read as smooth balloons; it
   // fades out with distance, otherwise the hash aliases into a grey checkerboard on
   // the far canyon walls
-  alb *= mix(1.0, 0.84 + 0.32 * h31(floor(wp * 3.1) + vec3<f32>(seed * 17.0)), sstep(54.0, 12.0, dist));
+  alb *= mix(1.0, 0.88 + 0.24 * h31(floor(wp * 4.6) + vec3<f32>(seed * 17.0)), sstep(40.0, 10.0, dist));
   // magenta encrusting cover: patchy growth that favours quiet upward faces, but with
   // a 3D boundary so it never paints a clean "pink cap" across the top of a boulder
   let cov = sstep(0.46, 0.72, fbm2(wp.xz * 0.24 + wp.y * 0.16 + seed * 3.0, 2)) * up * up;
@@ -1020,16 +1023,17 @@ fn rayDirAt(uv : vec2<f32>) -> vec3<f32> {
     // stretched vertically so the cells read as columns of light
     let q = vec2<f32>(p.x + u.sunDir.x * p.y * 0.22, p.z + u.sunDir.z * p.y * 0.22) * 0.021;
     var m = fbm2(q + vec2<f32>(drift, -drift * 0.63), 2);
-    m = smoothstep(0.455, 0.665, m);               // narrow beams, wide quiet gaps
+    m = smoothstep(0.470, 0.620, m);               // narrow beams, wide quiet gaps
     m = m * m * (3.0 - 2.0 * m);                   // second ease: crisp shaft edges
     let near = (1.0 - exp(-t * 0.10)) * exp(-t * 0.009);   // no veil right in front of the eye
     acc += m * exp(-t * ab * 0.6) * near * dt;
     t += dt;
   }
   // acc is an integral in metres; the scattering coefficient turns it into radiance
-  let shaft = acc * 0.0165 * (0.20 + 1.85 * pow(sd, 2.0));
-  // broad halo plus a blown-out sun disc seen through the water column
-  let sky = pow(sd, 6.0) * 0.30 + pow(sd, 130.0) * 2.2;
+  let shaft = acc * 0.0185 * (0.32 + 1.55 * pow(sd, 2.0));
+  // Small halo, defined disc: the sun should bloom as a light source instead of
+  // painting a milky ceiling across the upper half of the frame.
+  let sky = pow(sd, 7.0) * 0.22 + pow(sd, 115.0) * 2.7;
   return vec4<f32>(u.sunColor.rgb * (shaft + sky) * u.params1.z, 1.0);
 }
 // 13-tap wide separable blur; one entry point per axis
