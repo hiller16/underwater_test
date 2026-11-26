@@ -1,0 +1,45 @@
+# harness 專案設定（cline-proxy/harness.js init 產生）。
+# 這個資料夾登記之後，在這裡用 Cline（或其他客戶端把模型名稱填成 qwen@project_02）時，proxy 就照這份設定：
+# 專案檔案有變動時自動跑驗收、和基準版本比、連續退步就還原。
+# 改完存檔就生效（下一個請求重新讀）；寫錯的鍵或型別，proxy 會回錯誤，不會默默用預設值。
+
+# 專案名稱：登記用的名稱，也是模型名稱 @ 後面那段。只能用英數字、. _ -
+name: project_02
+
+verify:
+  # 驗收指令：在專案根目錄用 shell 執行。檔案有變動時環境就跑一次，結果附給模型。
+  # 大型專案可以只填相關的那組測試，每次都跑完整套件會拖慢每一輪。
+  cmd: npm test
+  # 輸出格式：auto 自動判斷（node:test、TAP、jest、vitest、pytest、PASS／FAIL 都認得）。
+  # 想要「之前通過、這次失敗」逐項比對，測試工具要列出每一項的名稱：
+  #   jest 加 --verbose、vitest 加 --reporter=verbose、pytest 加 -v；node:test 預設就有。
+  format: auto
+  # 超過幾秒還沒結束就中止（整棵行程樹）並告訴模型可能有無限迴圈。
+  timeoutSec: 300
+
+# 哪些檔案變了才驗收（相對專案根目錄，可以用 * 與 **）。不寫就是整個專案。
+# 下面這些一律不看：.git node_modules __pycache__ .venv venv env dist build coverage .pytest_cache .harness.yaml
+# watch:
+#   - src/**
+#   - test/**
+# 另外要排除的（資料夾名稱，或含 / 的路徑樣式）
+# ignore:
+#   - fixtures/big
+
+# 冒煙測試：檔案有變動、驗收跑完之後，用無頭瀏覽器載入這些 HTML，主控台錯誤寫成 FAIL 行附給模型。
+# screenshot: true 會檢查畫面並附截圖（每張約 1,000 token；第一次、畫面問題有變化、每改 8 次才附）。
+# smoke:
+#   pages:
+#     - index.html
+#   screenshot: false
+
+restore:
+  # 基準版本：通過數最多的那版；之後只要沒有任何測試從通過變失敗，新的版本就成為基準（刪掉、改名的測試不算失敗）。
+  # 基準版本之後，連續幾次驗收都比它差（通過數比它少、而且有測試從通過變失敗，或建置壞了），環境就把 watch 範圍的檔案換回那一版（0 = 不還原）。
+  # 「修好一項基準版本沒過的測試」算有進展，次數重新算，所以探索新做法、而且有進展時不會被還原。
+  # 換掉的版本存在 %USERPROFILE%\.harness\projects\project_02\_attempts\，之後新增的檔案不會被刪。
+  # 注意：這會直接改寫專案裡的檔案；編輯器開著同一個檔、有沒存的修改時，存檔前要先看一下差異。
+  belowBest: 8
+
+# 狀態（驗收紀錄、快照、被換掉的版本）放在 %USERPROFILE%\.harness\projects\project_02\，不寫進專案、不動 git。
+# 考試用的 state: project、main、heldout 不要在一般專案用。

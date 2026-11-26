@@ -1,0 +1,2630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kelp Cathedral - WebGPU Underwater</title>
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#03101a; }
+  #cv { display:block; width:100vw; height:100vh; }
+  #cv.locked { cursor:none; }
+  #hud { position:fixed; left:10px; top:9px; font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;
+         color:#cdeef6; text-shadow:0 1px 3px rgba(0,0,0,.85); white-space:pre; pointer-events:none; opacity:.9; }
+  #ov { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
+        gap:6px; background:radial-gradient(ellipse at 50% 38%, rgba(14,86,116,.5), rgba(2,10,20,.9));
+        color:#e2f7fb; font:13px/1.7 ui-monospace,SFMono-Regular,Consolas,monospace; text-align:center;
+        transition:opacity .45s ease; }
+  #ov.hide { opacity:0; pointer-events:none; }
+  #ov h1 { margin:0 0 6px; font:600 26px/1.2 ui-monospace,Consolas,monospace; letter-spacing:.16em;
+           color:#a8f0e2; text-shadow:0 0 22px rgba(60,220,220,.45); }
+  #ov .k { color:#ffd9a0; }
+  #ov .dim { color:#8fb9c6; }
+  #err { position:fixed; right:10px; top:9px; max-width:46vw; font:11px/1.4 ui-monospace,Consolas,monospace;
+         color:#ffb4b4; text-shadow:0 1px 2px #000; white-space:pre-wrap; pointer-events:none; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="hud"></div>
+<div id="err"></div>
+<div id="ov">
+  <h1>KELP&nbsp;CATHEDRAL</h1>
+  <div><span class="k">WASD</span> swim &nbsp; <span class="k">Q</span>/<span class="k">E</span> down/up &nbsp;
+       <span class="k">Shift</span> surge &nbsp; <span class="k">H</span> hud &nbsp; <span class="k">R</span> reset</div>
+  <div class="dim">mouse look uses pointer lock - click the water to dive in</div>
+  <div class="dim" id="ovgpu">initialising webgpu...</div>
+</div>
+<script>
+'use strict';
+// ============================================================
+//  Kelp Cathedral - procedural WebGPU underwater scene.
+//  No engine, no assets: every mesh, texture-free material and
+//  animation is generated here. Zero per-frame JS allocations.
+// ============================================================
+
+const Q = new URLSearchParams(location.search);
+const qp = (k, d) => (Q.has(k) ? parseFloat(Q.get(k)) : d);
+
+const CFG = {
+  // world
+  surfaceY: 62.0,
+  groundHalf: 240.0,      // ground mesh spans +/- this in x,z
+  gridN: 300,             // ground grid subdivisions
+  // fjord layout: valley floor near -34, walls that climb past the surface so the
+  // world edge is never visible from inside the canyon.
+  canyon: { base: -34.0, wall: 52.0, inner: 44.0, outer: 104.0, rim: 96.0 },
+
+  // camera
+  fovDeg: 72, near: 0.15, far: 900,
+  speed: 13.0, boost: 3.1, damping: 9.0, mouseGain: 0.0022,
+  startPos: [-6, -6, 104], startYaw: 0.06, startPitch: -0.04,
+
+  // render
+  msaa: qp('msaa', 4), renderScale: qp('scale', 1), dprCap: qp('dpr', 1.5),
+  fogCull: qp('fogCull', 215),   // instances beyond this distance are culled
+  raySteps: qp('steps', 24), rayReach: qp('reach', 170),
+  kelpMax: qp('kelpMax', 6500), kelpNodes: qp('nodes', 13),
+
+  // water / lighting
+  absorb: [0.0262, 0.0139, 0.0092],   // per-metre RGB extinction (red dies first)
+  shallow: [0.038, 0.262, 0.378],     // in-scatter radiance near the surface
+  deep: [0.0035, 0.044, 0.118],       // in-scatter radiance in the deep blue
+  sunDir: [0.22, 0.70, -0.68],
+  sunColor: [1.00, 0.94, 0.79],
+  sunIntensity: 2.10,
+  skyAmbient: 0.47,
+  exposure: 1.07,
+  contrast: 0.42,
+  causticStrength: 0.95,
+  godrayStrength: 0.86,
+  godrayDecay: 0.955,
+  bloomThreshold: 1.35,
+  bloomIntensity: 0.55,
+  vignette: 0.34,
+  density: qp('density', 1),          // instance-count multiplier
+  diag: qp('diag', 0),                // 1 = composite shows the NaN map
+};
+{ // URL overrides for tuning during the critic loop
+  const o = { exposure: 'exposure', sunIntensity: 'sun', causticStrength: 'caustic',
+              godrayStrength: 'gr', bloomIntensity: 'bloom', vignette: 'vig', fovDeg: 'fov' };
+  for (const k in o) { if (Q.has(o[k])) CFG[k] = qp(o[k], CFG[k]); }
+}
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const smoothstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+
+// ---------------- mat4 (column-major, WebGPU z in [0,1]) ----------------
+function m4perspective(o, fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy * 0.5);
+  o[0] = f / aspect; o[1] = 0; o[2] = 0; o[3] = 0;
+  o[4] = 0; o[5] = f; o[6] = 0; o[7] = 0;
+  o[8] = 0; o[9] = 0; o[10] = far / (near - far); o[11] = -1;
+  o[12] = 0; o[13] = 0; o[14] = near * far / (near - far); o[15] = 0;
+  return o;
+}
+function m4mul(o, a, b) { // o = a * b
+  for (let c = 0; c < 4; c++) {
+    const b0 = b[c * 4], b1 = b[c * 4 + 1], b2 = b[c * 4 + 2], b3 = b[c * 4 + 3];
+    o[c * 4 + 0] = a[0] * b0 + a[4] * b1 + a[8] * b2 + a[12] * b3;
+    o[c * 4 + 1] = a[1] * b0 + a[5] * b1 + a[9] * b2 + a[13] * b3;
+    o[c * 4 + 2] = a[2] * b0 + a[6] * b1 + a[10] * b2 + a[14] * b3;
+    o[c * 4 + 3] = a[3] * b0 + a[7] * b1 + a[11] * b2 + a[15] * b3;
+  }
+  return o;
+}
+// view from eye + yaw/pitch (yaw 0 looks toward -z, +yaw turns right)
+function m4view(o, ex, ey, ez, yaw, pitch) {
+  const cp = Math.cos(pitch), sp = Math.sin(pitch), cy = Math.cos(yaw), sy = Math.sin(yaw);
+  const fx = sy * cp, fy = sp, fz = -cy * cp;   // forward (yaw 0 looks toward -z)
+  const rx = cy, ry = 0, rz = sy;               // right
+  const ux = ry * fz - rz * fy, uy = rz * fx - rx * fz, uz = rx * fy - ry * fx;
+  // right-handed view space: -z is forward, so the third row is -forward
+  o[0] = rx; o[1] = ux; o[2] = -fx; o[3] = 0;
+  o[4] = ry; o[5] = uy; o[6] = -fy; o[7] = 0;
+  o[8] = rz; o[9] = uz; o[10] = -fz; o[11] = 0;
+  o[12] = -(rx * ex + ry * ey + rz * ez);
+  o[13] = -(ux * ex + uy * ey + uz * ez);
+  o[14] = (fx * ex + fy * ey + fz * ez);
+  o[15] = 1;
+  return o;
+}
+
+// ---------------- deterministic PRNG + noise ----------------
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function h2i(x, y) {
+  let h = Math.imul(x, 374761393) + Math.imul(y, 668265263);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function vn2(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const a = h2i(xi, yi), b = h2i(xi + 1, yi), c = h2i(xi, yi + 1), d = h2i(xi + 1, yi + 1);
+  return (a + (b - a) * u) * (1 - v) + (c + (d - c) * u) * v;
+}
+function fbm2(x, y, oct) {
+  let s = 0, amp = 0.5, norm = 0, fx = x, fy = y;
+  for (let i = 0; i < oct; i++) { s += amp * vn2(fx, fy); norm += amp; fx = fx * 2.03 + 37.1; fy = fy * 1.97 - 21.7; amp *= 0.5; }
+  return s / norm;
+}
+
+// ---------------- terrain ----------------
+// The world is a winding canyon running along +/-z, walled by towering rock,
+// with shelves where the set pieces sit. Everything else is placed on top of it.
+function canyonCenter(z) {
+  return 26 * Math.sin(z * 0.0125) + 13 * Math.sin(z * 0.0041 + 1.9) + 5 * Math.sin(z * 0.021 + 0.7);
+}
+function bedHeight(x, z) {
+  const C = CFG.canyon;
+  const d = Math.abs(x - canyonCenter(z));
+  let h = C.base + 5.0 * (fbm2(x * 0.011, z * 0.011, 4) - 0.5) * 2.0 + 2.2 * Math.sin(z * 0.026 + x * 0.017);
+  // main walls
+  const wall = smoothstep(C.inner, C.outer, d);
+  h += wall * (C.wall + 26.0 * (fbm2(x * 0.0072 + 11.0, z * 0.0072 - 5.0, 3) - 0.5));
+  // rim: rock keeps climbing above the waterline, hiding the edge of the world
+  h += smoothstep(C.outer, C.outer + 116, d) * C.rim;
+  // terraces on the walls so ledges and overhangs appear
+  h += wall * 4.5 * Math.sin(d * 0.13 + z * 0.02);
+  // bouldery relief everywhere, sharper ridges on the canyon walls
+  h += 2.6 * (fbm2(x * 0.075 + 3.1, z * 0.075 - 1.7, 3) - 0.5) * 2.0;
+  h += wall * 9.0 * (fbm2(x * 0.048 - 7.0, z * 0.048 + 2.3, 3) - 0.5) * 2.0;
+  // close the valley far away in +/- z so no boundary is ever visible
+  h += smoothstep(120, 196, Math.abs(z)) * (92 + 34 * fbm2(x * 0.01 - 3, z * 0.01 + 9, 2));
+  // shelves for the two set pieces (sandy pads on the valley floor)
+  h = shelf(h, x, z, SET.ship.x, SET.ship.z, SET.ship.r, -25.5);
+  h = shelf(h, x, z, SET.fluke.x, SET.fluke.z, SET.fluke.r, -26.5);
+  return h;
+}
+function shelf(h, x, z, sx, sz, r, target) {
+  const dx = x - sx, dz = z - sz, dd = Math.sqrt(dx * dx + dz * dz);
+  const t = smoothstep(r, r * 0.55, dd);
+  return h * (1 - t) + target * t;
+}
+// surface current used by kelp sway (kept identical in WGSL)
+// ---------------- frame-time / gpu timing ----------------
+// Percentile helper shared by the frame-time ring buffers.
+function pctList(arr, n) {
+  const c = Array.prototype.slice.call(arr.subarray(0, n));
+  c.sort((a, b) => a - b);
+  return c;
+}
+function tsReport(arr, n) {
+  if (!n) return { count: 0 };
+  const c = pctList(arr, n);
+  const P = p => c[clamp(Math.round(p * (n - 1)), 0, n - 1)];
+  const sum = c.reduce((x, y) => x + y, 0);
+  return { count: n, avg: +(sum / n).toFixed(3), p50: +P(.5).toFixed(3),
+           p99: +P(.99).toFixed(3), max: +c[n - 1].toFixed(3) };
+}
+class Stats {
+  constructor(cap) {
+    this.cap = cap; this.n = 0; this.w = 0;
+    this.cpu = new Float32Array(cap);   // rAF delta (frame pacing)
+    this.gpu = new Float32Array(cap);   // submit -> onSubmittedWorkDone latency
+    this.srt = new Float32Array(cap);   // scratch for percentiles
+    this.gonly = new Float32Array(cap); // GPU-timestamp samples (real device time)
+    this.gw = 0; this.gn = 0;
+    this.t0 = 0; this.tPrev = 0;
+  }
+  reset() { this.n = 0; this.w = 0; this.gw = 0; this.gn = 0; }
+  push(cpuMs, gpuMs) {
+    const i = this.w; this.w = (this.w + 1) % this.cap; this.n = Math.min(this.n + 1, this.cap);
+    this.cpu[i] = cpuMs; this.gpu[i] = gpuMs;
+  }
+  pushGpu(ms) {
+    const i = this.gw % this.cap; this.gw++; this.gn = Math.min(this.gn + 1, this.cap);
+    this.gonly[i] = ms;
+  }
+  static pct(arr, n, p) {
+    const s = arr.subarray(0, n); for (let i = 0; i < n; i++) s[i] = arr[i];
+    const c = Array.prototype.slice.call(s); c.sort((a, b) => a - b);
+    return c[clamp(Math.round(p * (n - 1)), 0, n - 1)];
+  }
+  report() {
+    const n = this.n; if (!n) return { frames: 0 };
+    const cpu = Array.prototype.slice.call(this.cpu.subarray(0, n)).sort((a, b) => a - b);
+    const gpu = Array.prototype.slice.call(this.gpu.subarray(0, n)).sort((a, b) => a - b);
+    const P = (c, p) => c[clamp(Math.round(p * (n - 1)), 0, n - 1)];
+    const sum = a => a.reduce((x, y) => x + y, 0);
+    return {
+      frames: n,
+      ms: { avg: +(sum(cpu) / n).toFixed(2), p50: +P(cpu, .5).toFixed(2), p90: +P(cpu, .9).toFixed(2),
+            p99: +P(cpu, .99).toFixed(2), p999: +P(cpu, .999).toFixed(2), max: +cpu[n - 1].toFixed(2) },
+      fps: { avg: +(1000 / (sum(cpu) / n)).toFixed(1), p1low: +(1000 / P(cpu, .99)).toFixed(1),
+             p01low: +(1000 / cpu[n - 1]).toFixed(1) },
+      gpuMs: { avg: +(sum(gpu) / n).toFixed(2), p50: +P(gpu, .5).toFixed(2),
+               p99: +P(gpu, .99).toFixed(2), p999: +P(gpu, .999).toFixed(2), max: +gpu[n - 1].toFixed(2) },
+      tsMs: tsReport(this.gonly, this.gn),
+    };
+  }
+}
+// ============================ WGSL: scene ============================
+const WGSL_COMMON = `
+struct U {
+  viewProj : mat4x4<f32>,
+  view     : mat4x4<f32>,
+  camPos   : vec4<f32>,   // xyz + time
+  camBasis : vec4<f32>,   // yaw, pitch, surfaceY, tan(fov/2)
+  sunDir   : vec4<f32>,   // xyz (toward the sun) + intensity
+  sunColor : vec4<f32>,
+  absorb   : vec4<f32>,   // per-metre extinction rgb
+  shallow  : vec4<f32>,   // in-scatter radiance near the surface
+  deep     : vec4<f32>,   // in-scatter radiance in the deep
+  params0  : vec4<f32>,   // exposure, causticStrength, skyAmbient, fogCull
+  params1  : vec4<f32>,   // near, far, godrayStrength, godrayDecay
+  params2  : vec4<f32>,   // bloomThreshold, bloomIntensity, vignette, contrast
+  screen   : vec4<f32>,   // width, height, 1/w, 1/h
+  params3  : vec4<f32>,   // 1/rayW, 1/rayH, ray steps, ray reach
+  params4  : vec4<f32>,   // diagnostics (1 = show NaN map), spare, spare, spare
+};
+@group(0) @binding(0) var<uniform> u : U;
+
+const TAU : f32 = 6.2831853;
+
+fn fract21(p : vec2<f32>) -> vec2<f32> { return p - floor(p); }
+fn h11(p : f32) -> f32 {
+  let q = fract(p * 0.1031);
+  let q3 = q * (q + 33.33) * (q + q);
+  return fract(q3 * q3);
+}
+fn h31(p : vec3<f32>) -> f32 {
+  let q = fract(p * vec3(0.1031, 0.1030, 0.0973));
+  return fract(((p.x + q.y) * (p.y + q.z)) * p.z) ;
+}
+fn h21(p : vec2<f32>) -> f32 {
+  var q = fract21(p * vec2(0.1031, 0.1030));
+  q += dot(q, q + 33.33);
+  return fract((q.x + q.y) * q.x);
+}
+fn h33(p : vec3<f32>) -> vec3<f32> {
+  var q = fract(p * vec3(0.1031, 0.1030, 0.0973));
+  q += dot(q, q.yzx + 33.33);
+  return fract((q.xxx + q.yzy) * q.zxy);
+}
+// smooth value noise
+fn vn3(p : vec3<f32>) -> f32 {
+  let i = floor(p); let f = p - i;
+  let v = f * f * (3.0 - 2.0 * f);
+  let a = h31(i + vec3(0,0,0)); let b = h31(i + vec3(1,0,0));
+  let c = h31(i + vec3(0,1,0)); let d = h31(i + vec3(1,1,0));
+  let e = h31(i + vec3(0,0,1)); let ff = h31(i + vec3(1,0,1));
+  let g = h31(i + vec3(0,1,1)); let h = h31(i + vec3(1,1,1));
+  let x0 = mix(mix(a, b, v.x), mix(c, d, v.x), v.y);
+  let x1 = mix(mix(e, ff, v.x), mix(g, h, v.x), v.y);
+  return mix(x0, x1, v.z);
+}
+fn vn2(p : vec2<f32>) -> f32 {
+  let i = floor(p); let f = fract21(p);
+  let v = f * f * (3.0 - 2.0 * f);
+  let a = h21(i + vec2(0,0)); let b = h21(i + vec2(1,0));
+  let c = h21(i + vec2(0,1)); let d = h21(i + vec2(1,1));
+  return mix(mix(a, b, v.x), mix(c, d, v.x), v.y);
+}
+fn fbm3(p : vec3<f32>, oct : i32) -> f32 {
+  var s = 0.0; var a = 0.5; var n = 0.0; var q = p;
+  for (var i = 0; i < oct; i++) { s += a * vn3(q); n += a; q = q * 2.03 + vec3(31.7, -11.3, 19.1); a *= 0.5; }
+  return s / n;
+}
+fn fbm2(p : vec2<f32>, oct : i32) -> f32 {
+  var s = 0.0; var a = 0.5; var n = 0.0; var q = p;
+  for (var i = 0; i < oct; i++) { s += a * vn2(q); n += a; q = q * 2.07 + vec2(17.35, -7.17); a *= 0.5; }
+  return s / n;
+}
+fn sstep(a : f32, b : f32, x : f32) -> f32 {
+  let t = clamp((x - a) / (b - a), 0.0, 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+// Fresnel-style cube. Using pow() here is a trap: interpolated normals make the dot
+// product creep a hair past 1, and pow() of a negative base is undefined in WGSL - on
+// AMD it returns NaN, which the tonemapper then stamps as a hard black square.
+fn cube(x : f32) -> f32 { return x * x * x; }
+// ---- water ----
+fn waterTint(depthBelow : f32) -> vec3<f32> {
+  // cyan near the surface, true blue in the depths: a slightly biased ramp keeps the
+  // near field colourful while the far field darkens fast enough to read as depth.
+  let k = clamp(depthBelow / 74.0, 0.0, 1.0);
+  return mix(u.shallow.rgb, u.deep.rgb, k * k * 0.55 + 0.45 * k);
+}
+// ---- colour grading helpers ----
+// Narkowicz ACES approximation. Its raw shoulder sits at 2.51/4.43 = 0.567, so the
+// curve is renormalised: without that, sunlight could never reach display white and
+// the whole frame would be trapped in the lower three quarters of sRGB (flat, milky).
+fn aces(x : vec3<f32>) -> vec3<f32> {
+  let a = x * (2.51 * x + 0.03);
+  let b = x * (4.43 * x + 0.59) + 0.14;
+  return clamp(a / b * 1.7647, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+// in-scattered radiance along a ray: this is what distant geometry fades into,
+// so the open-water background uses exactly the same expression.
+fn waterInscat(midPos : vec3<f32>, dir : vec3<f32>, shaft : f32) -> vec3<f32> {
+  let depth = max(u.camBasis.z - midPos.y, 0.0);
+  let tint = waterTint(depth);
+  let sd = max(dot(dir, u.sunDir.xyz), 0.0);
+  let ph = 0.08 + 0.34 * pow(sd, 5.0) + 1.30 * pow(sd, 70.0);
+  // sunlight only reaches the upper part of the water column, so the haze towards the
+  // floor is blue-black: that is what gives the canyon its depth.
+  let sunReach = 0.22 + 0.78 * exp(-depth * 0.022);
+  return tint * (u.params0.z * 0.55) + u.sunColor.rgb * (u.sunDir.w * 0.070 * ph * sunReach) * (1.0 + shaft * 1.6);
+}
+// Beer-Lambert absorption + integrated in-scatter. The haze is deliberately darker
+// than sunlit rock near the camera so distance reads as cyan -> deep blue.
+// Every material passes through here, so this is also where a poisoned pixel is caught:
+// WGSL leaves pow() of a negative base (interpolated normals can push a dot product
+// past 1) undefined, and one NaN face entering the bloom chain smears out as a hard-edged
+// black card. Falling back to the local haze is invisible.
+fn fogBlend(col : vec3<f32>, dist : f32, midPos : vec3<f32>, dir : vec3<f32>, shaft : f32) -> vec3<f32> {
+  let T = exp(-u.absorb.xyz * dist);
+  let ins = waterInscat(midPos, dir, shaft);
+  let ok = all(col >= vec3<f32>(0.0)) && all(col <= vec3<f32>(1.0e4));
+  return select(ins, col, ok) * T + ins * (vec3<f32>(1.0) - T);
+}
+// distance-based amount of caustic light (weak far away, and weak deep down)
+fn causticVisibility(worldY : f32, dist : f32) -> f32 {
+  let depth = clamp((u.camBasis.z - worldY) / 90.0, 0.0, 1.0);
+  return (1.0 - depth * 0.75) * exp(-dist * 0.011);
+}
+// classic sum-of-cosines caustic network, animated by the current
+fn caustics(p : vec2<f32>, t : f32) -> f32 {
+  let uv = p * 1.35;
+  var q = fract21(uv / TAU) * TAU - 250.0;
+  var i = q;
+  var c = 1.0;
+  let inten = 0.0055;
+  for (var n = 0; n < 4; n++) {
+    let ft = t * (1.0 - (3.0 / f32(n + 1)));
+    let sx = sin(i.x + ft); let sy = cos(i.y + ft);
+    i = q + vec2(cos(ft - i.x) + sin(ft + i.y), sin(ft - i.y) + cos(ft + i.x));
+    c += 1.0 / max(length(vec2(q.x / (sx / inten + 0.0001), q.y / (sy / inten + 0.0001))), 0.05);
+  }
+  c = c / 4.0;
+  c = 1.16 - pow(c, 7.0);
+  return clamp(c, 0.0, 1.0);
+}
+fn luma3(c : vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722)); }
+// 1 when any channel is NaN or absurdly large. Comparisons with NaN are false, so the
+// negated test catches both cases without needing isFinite().
+fn poison(v : vec3<f32>) -> f32 {
+  let a = abs(v);
+  return select(0.0, 1.0, !((a.x <= 1.0e4) && (a.y <= 1.0e4) && (a.z <= 1.0e4)));
+}
+fn srgbEnc(c : vec3<f32>) -> vec3<f32> {
+  return mix(pow(c, vec3<f32>(1.0 / 2.4)) * 1.055 - vec3<f32>(0.055), c * 12.92,
+             step(c, vec3<f32>(0.0031308)));
+}
+fn sdHash2(p : vec2<f32>) -> f32 {
+  return fract(sin(dot(p, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+}
+// round twinkling specks, one per lattice cell (kelp sparkle / plankton)
+fn specks(p : vec3<f32>, t : f32, density : f32, size : f32) -> f32 {
+  let c = floor(p); let f = p - c;
+  let h = h31(c);
+  let ctr = vec3<f32>(h31(c + vec3<f32>(11.0, 3.0, 7.0)), h31(c + vec3<f32>(23.0, 9.0, 1.0)),
+                      h31(c + vec3<f32>(37.0, 5.0, 13.0)));
+  let d = length(f - ctr);
+  let tw = 0.35 + 0.65 * sin(t * 3.1 + h * 61.0);
+  return smoothstep(size, 0.02, d) * step(1.0 - density, h) * tw;
+}
+// ---- shared vertex payload for lit geometry ----
+struct VSOut {
+  @builtin(position) pos : vec4<f32>,
+  @location(0) wpos : vec4<f32>,
+  @location(1) nrm : vec3<f32>,
+  @location(2) uv : vec2<f32>,
+  @location(3) aux : vec4<f32>,
+};
+// ---- fullscreen passes ----
+struct PVS { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32> };
+@vertex fn fullVS(@builtin(vertex_index) ii : u32) -> PVS {
+  var o : PVS;
+  let p = vec2<f32>(f32(i32(ii & 1u) * 4 - 1), f32(i32(ii & 2u) * 2 - 1));
+  o.pos = vec4<f32>(p, 0.0, 1.0);
+  o.uv = p * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+  return o;
+}
+// open water behind everything: same in-scatter as distant geometry, so no seam
+// appears where the world ends and the camera looks into empty blue.
+@fragment fn bgFS(i : PVS) -> @location(0) vec4<f32> {
+  let ndc = vec2<f32>(i.uv.x * 2.0 - 1.0, 1.0 - i.uv.y * 2.0);
+  let asp = u.screen.x / u.screen.y;
+  let v = vec3<f32>(ndc.x * u.camBasis.w * asp, ndc.y * u.camBasis.w, -1.0);
+  let dir = normalize(vec3<f32>(dot(u.view[0].xyz, v), dot(u.view[1].xyz, v), dot(u.view[2].xyz, v)));
+  let far = 165.0;
+  var c = waterInscat(u.camPos.xyz + dir * far, dir, 0.0);
+  // sun disc glow seen through the water, plus a soft vertical gradient
+  let sd = max(dot(dir, u.sunDir.xyz), 0.0);
+  c += u.sunColor.rgb * pow(sd, 12.0) * 0.30 * u.sunDir.w;
+  return vec4<f32>(c, 1.0);
+}
+`;
+
+// ---- seabed: procedural sand / rock / magenta ground cover ----
+const WGSL_BED = WGSL_COMMON + `
+fn bedNoise(p : vec3<f32>) -> f32 {
+  return fbm3(p * vec3<f32>(0.09, 0.11, 0.09), 3);
+}
+@vertex fn bedVS(@location(0) pos : vec3<f32>, @location(1) nrm : vec3<f32>) -> VSOut {
+  var o : VSOut;
+  o.pos = u.viewProj * vec4<f32>(pos, 1.0);
+  o.wpos = vec4<f32>(pos, 0.0);
+  o.nrm = nrm;
+  o.uv = pos.xz * 0.02;
+  o.aux = vec4<f32>(0.0);
+  return o;
+}
+@fragment fn bedFS(in : VSOut) -> @location(0) vec4<f32> {
+  let wp = in.wpos.xyz;
+  let dist = length(wp - u.camPos.xyz);
+  let dir = (wp - u.camPos.xyz) / max(dist, 0.001);
+
+  // fine surface relief: perturb the geometric normal with two extra taps
+  let nz = bedNoise(wp);
+  let ex = bedNoise(wp + vec3<f32>(1.0 / 0.09 * 0.35, 0.0, 0.0));
+  let ez = bedNoise(wp + vec3<f32>(0.0, 0.0, 1.0 / 0.09 * 0.35));
+  let detail = vec3<f32>((ex - nz), 0.0, (ez - nz)) * 3.2;
+  let n = normalize(in.nrm + detail - vec3<f32>(0.0, detail.y, 0.0));
+
+  let slope = 1.0 - clamp(n.y, 0.0, 1.0);
+  // sand in the flat valley, craggy rock on the walls
+  let grain = fbm3(wp * vec3<f32>(0.55, 0.7, 0.55), 2);
+  let strata = 0.5 + 0.5 * sin(wp.y * 0.55 + fbm3(wp * 0.06, 2) * 6.0);
+  var rock = mix(vec3<f32>(0.058, 0.082, 0.108), vec3<f32>(0.150, 0.185, 0.200), grain);
+  rock = mix(rock, vec3<f32>(0.215, 0.235, 0.230), strata * 0.30 * sstep(0.15, 0.9, slope));
+  let sand = mix(vec3<f32>(0.150, 0.225, 0.228), vec3<f32>(0.300, 0.355, 0.338), grain);
+  var alb = mix(sand, rock, sstep(0.16, 0.52, slope));
+
+  // magenta ground cover creeping over flats and ledges. Two noise scales: broad
+  // beds with a finer tongue pattern on the edge, otherwise the boundary reads as a
+  // set of soft pink islands dropped on the sand.
+  var gc = sstep(0.40, 0.60, fbm2(wp.xz * 0.028, 2) * 0.65 + fbm2(wp.xz * 0.085 + 4.0, 2) * 0.35);
+  gc *= 1.0 - sstep(0.28, 0.55, slope);
+  let gcHue = 0.5 + 0.5 * sin(wp.x * 0.05 + wp.z * 0.045 + nz * 5.0);
+  let magenta = mix(vec3<f32>(0.150, 0.030, 0.108), vec3<f32>(0.380, 0.095, 0.245), gcHue);
+  alb = mix(alb, magenta, gc * 0.82);
+  // fine speckle so the floor never reads as smooth plaster; fades out with distance
+  // so the high-frequency term cannot alias into a shimmering checkerboard
+  alb *= 0.92 + 0.16 * mix(h31(floor(wp * 1.30)), fbm3(wp * vec3<f32>(1.30, 1.55, 1.30), 2),
+                           sstep(46.0, 10.0, dist));
+  // algae sheen in shallow water
+  alb = mix(alb, vec3<f32>(0.20, 0.38, 0.24), sstep(24.0, 6.0, u.camBasis.z - wp.y) * 0.30 * (1.0 - slope));
+
+  // lighting: sun + sky gradient
+  let sd = max(dot(n, u.sunDir.xyz), 0.0);
+  let wsd = pow(clamp(dot(n, u.sunDir.xyz) * 0.5 + 0.5, 0.0, 1.0), 1.5);
+  let skyUp = 0.5 + 0.5 * n.y;
+  var light = u.sunColor.rgb * u.sunDir.w * (sd * 0.40 + wsd * 0.26)
+            + waterTint(max(u.camBasis.z - wp.y, 0.0)) * u.params0.z * (1.30 + 0.85 * skyUp)
+            + vec3<f32>(0.085, 0.022, 0.048) * u.params0.z * gc;   // magenta bounce
+  // caustics on upward faces
+  let ca = caustics(wp.xz + vec2<f32>(1.0, 0.4) * u.camPos.w * 0.35, u.camPos.w * 0.55);
+  light += vec3<f32>(0.42, 0.92, 0.95) * ca * u.params0.y * 0.45 * (max(n.y, 0.0) * causticVisibility(wp.y, dist));
+  // fake contact shading in creases
+  light *= 0.62 + 0.5 * nz;
+
+  return vec4<f32>(fogBlend(alb * light, dist, mix(u.camPos.xyz, wp, 0.5), dir, 0.0), 1.0);
+}
+`;
+
+// ---- water surface seen from below (waves, Snell window, glitter, sun) ----
+const WGSL_SURF = WGSL_COMMON + `
+fn waveH(p : vec2<f32>, t : f32) -> f32 {
+  let a = p * 0.021 + vec2<f32>(0.055, -0.031) * t;
+  let b = p * 0.062 + vec2<f32>(-0.09, 0.07) * t;
+  let c = p * 0.155 + vec2<f32>(0.13, 0.11) * t;
+  return (fbm2(a, 2) - 0.5) * 5.0 + (vn2(b) - 0.5) * 1.7 + (vn2(c) - 0.5) * 0.55;
+}
+// cheaper height used for the per-pixel normal (one octave less)
+fn waveQ(p : vec2<f32>, t : f32) -> f32 {
+  let a = p * 0.021 + vec2<f32>(0.055, -0.031) * t;
+  let b = p * 0.062 + vec2<f32>(-0.09, 0.07) * t;
+  return (fbm2(a, 2) - 0.5) * 5.0 + (vn2(b) - 0.5) * 1.7;
+}
+fn waveNQ(p : vec2<f32>, t : f32, e : f32) -> vec3<f32> {
+  let h0 = waveQ(p, t);
+  let hx = waveQ(p + vec2<f32>(e, 0.0), t) - h0;
+  let hz = waveQ(p + vec2<f32>(0.0, e), t) - h0;
+  return normalize(vec3<f32>(-hx / e, 1.0, -hz / e));
+}
+fn skyRad(dir : vec3<f32>) -> vec3<f32> {
+  let up = clamp(dir.y, 0.0, 1.0);
+  let sd = max(dot(dir, u.sunDir.xyz), 0.0);
+  // bright halo overhead toward the sun, teal toward the horizon
+  var c = mix(vec3<f32>(0.62, 0.93, 0.99), vec3<f32>(0.05, 0.33, 0.50), pow(1.0 - up, 0.75));
+  // soft cloud banks projected onto the sky dome: the ceiling gets structure instead
+  // of reading as a flat disc
+  let cl = fbm2(dir.xz / max(dir.y, 0.22) * 0.55 + vec2<f32>(0.5, -0.35) * u.camPos.w * 0.013, 2);
+  c *= 0.80 + 0.42 * cl;
+  c = mix(c, vec3<f32>(1.35, 1.25, 0.96), pow(sd, 6.0) * 0.80);
+  c += u.sunColor.rgb * 5.5 * pow(sd, 150.0);
+  return c;
+}
+@vertex fn surfVS(@location(0) pos : vec3<f32>) -> VSOut {
+  var o : VSOut;
+  let t = u.camPos.w;
+  // the disc rides with the camera, so its dense rings always sit overhead instead of
+  // at whatever distance the world origin happens to be
+  var p = vec3<f32>(pos.x + u.camPos.x, 0.0, pos.z + u.camPos.z);
+  p.y = u.camBasis.z + waveH(p.xz, t);
+  o.pos = u.viewProj * vec4<f32>(p, 1.0);
+  o.wpos = vec4<f32>(p, 0.0);
+  o.nrm = waveNQ(p.xz, t, 1.2);
+  o.uv = pos.xz * 0.01;
+  o.aux = vec4<f32>(0.0);
+  return o;
+}
+@fragment fn surfFS(in : VSOut) -> @location(0) vec4<f32> {
+  let wp = in.wpos.xyz;
+  let dist = length(wp - u.camPos.xyz);
+  let V = normalize(u.camPos.xyz - wp);      // surface -> camera
+  let t = u.camPos.w;
+  // Per-pixel wave normal. The patch is coarse far away, so widen the finite
+  // difference with distance: distant facets average out instead of shimmering.
+  let Nb = -waveNQ(wp.xz, t, 0.65 + dist * 0.030);
+  let eta = 1.333;                           // water to air: gives the 48.6 deg Snell window
+  let r = refract(-V, Nb, eta);
+  let cosT = clamp(dot(V, -Nb), 0.0, 1.0);
+  let toSun = max(dot(-V, u.sunDir.xyz), 0.0);
+  // refraction through the window: the sky, funnelled by every wave facet. Kept just
+  // below the tonemapper's shoulder so the ceiling keeps its structure instead of
+  // turning into one white sheet.
+  var sky = skyRad(r) * vec3<f32>(0.88, 0.99, 1.04) * 1.40;
+  let sdR = max(dot(r, u.sunDir.xyz), 0.0);
+  sky += u.sunColor.rgb * (pow(sdR, 7.0) * 0.85 + pow(sdR, 60.0) * 4.2);
+  // total internal reflection: the underside mirrors the water and the distant kelp
+  let rr = reflect(-V, Nb);
+  var mir = waterInscat(u.camPos.xyz + rr * 95.0, rr, 0.0) * 1.10 + vec3<f32>(0.008, 0.040, 0.062);
+  mir += u.sunColor.rgb * pow(max(dot(rr, u.sunDir.xyz), 0.0), 40.0) * 2.2;
+  // ease across the critical angle rather than switching, so the window rim is a band
+  // of light instead of a hard silhouette line
+  let win = 1.0 - sstep(0.715, 0.618, cosT);
+  var col = mix(mir, sky, win);
+  col += u.sunColor.rgb * exp(-abs(cosT - 0.662) * 15.0) * 0.55;
+  // grazing view: the ceiling brightens toward a mirror, as it physically does
+  col *= 1.0 + 0.35 * (1.0 - win) * (1.0 - win);
+  // glitter: tight sparkles where wave facets catch the sun
+  let g = vn2(wp.xz * 1.6 + vec2<f32>(t * 0.9, -t * 0.6));
+  col += vec3<f32>(0.90, 1.00, 0.96) * pow(g, 26.0) * 4.0 * smoothstep(0.05, 0.50, toSun) * win;
+  return vec4<f32>(fogBlend(col, dist, mix(u.camPos.xyz, wp, 0.55), -V, 0.0), 1.0);
+}
+`;
+
+// ---- kelp: instanced stalks of twisted ribbons, cantilever sway, gold/green specks ----
+const WGSL_KELP = WGSL_COMMON + `
+@vertex fn kelpVS(
+  @location(0) lp : vec3<f32>, @location(1) ln : vec3<f32>, @location(2) luv : vec2<f32>,
+  @location(3) i0 : vec4<f32>, @location(4) i1 : vec4<f32>, @location(5) i2 : vec4<f32>,
+) -> VSOut {
+  var o : VSOut;
+  let t = u.camPos.w;
+  let h = i0.w;
+  let lv = luv.y;                       // 0 at the holdfast, 1 at the tip
+  let ph = i1.y;
+  // twist the blades around the stipe so a stalk reads as a plant, not a flat card
+  let tw = lv * i2.z + i1.w * 6.2831 + t * 0.07;
+  let cs = cos(tw); let sn = sin(tw);
+  let lx = lp.x * i1.x; let lz = lp.z * i1.x;
+  // cantilever sway: displacement grows with lv^2, phase drifts up the stalk
+  let disp = lv * lv;
+  let sx = sin(t * 0.62 + ph + lv * 1.7) * 0.72 + sin(t * 0.29 + ph * 2.3) * 0.28;
+  let sz = cos(t * 0.47 + ph * 1.3 - lv * 0.9) * 0.66 + sin(t * 0.21 + ph) * 0.34;
+  var wp = i0.xyz + vec3<f32>(lx * cs - lz * sn, lp.y * h, lx * sn + lz * cs);
+  wp.x += disp * (sx * 0.085 + i2.x * 0.10) * h;
+  wp.z += disp * (sz * 0.085 + i2.y * 0.10) * h;
+  let d = distance(wp, u.camPos.xyz);
+  if (d > u.params0.w) { o.pos = vec4<f32>(0.0, 0.0, 2.0, 1.0); return o; }
+  o.pos = u.viewProj * vec4<f32>(wp, 1.0);
+  o.wpos = vec4<f32>(wp, 0.0);
+  o.nrm = normalize(vec3<f32>(ln.x * cs - ln.z * sn, ln.y, ln.x * sn + ln.z * cs));
+  o.uv = luv;
+  o.aux = vec4<f32>(i1.z, i1.w, fract(i1.w * 7.13), d);
+  return o;
+}
+@fragment fn kelpFS(in : VSOut) -> @location(0) vec4<f32> {
+  let wp = in.wpos.xyz;
+  let dist = in.aux.w;
+  let dir = (wp - u.camPos.xyz) / max(dist, 0.001);
+  let tint = in.aux.x; let seed = in.aux.y;
+  let v = in.uv.y;
+  let n = normalize(in.nrm);
+
+  // green -> gold; the grain term is only resolved close up, cheap hash beyond, and
+  // the two cross-fade so no ring sweeps through the forest as the camera moves
+  var grain = h31(floor(wp * 1.6) + vec3<f32>(seed * 11.0));
+  if (dist < 66.0) { grain = mix(grain, fbm3(wp * vec3<f32>(0.9, 0.32, 0.9), 2), sstep(66.0, 38.0, dist)); }
+  var alb = mix(vec3<f32>(0.032, 0.088, 0.040), vec3<f32>(0.180, 0.265, 0.058), tint);
+  alb = mix(alb, vec3<f32>(0.400, 0.305, 0.062), tint * tint * 0.85);
+  alb *= 0.50 + 0.74 * grain;
+  alb *= 0.40 + 0.78 * v;                          // tips catch more light
+  // rare iridescent violet fronds for colour contrast against the green
+  let irid = sstep(0.075, 0.0, in.aux.z);
+  alb = mix(alb, mix(vec3<f32>(0.245, 0.055, 0.230), vec3<f32>(0.480, 0.150, 0.320), grain), irid);
+
+  let sd = dot(n, u.sunDir.xyz);
+  let front = max(sd, 0.0);
+  let back = max(-sd, 0.0);
+  let thin = 0.30 + 0.70 * v;                      // blades transmit more than the stipe
+  var light = u.sunColor.rgb * u.sunDir.w * (front * 0.52 + back * thin * 0.85)
+            + waterTint(max(u.camBasis.z - wp.y, 0.0)) * u.params0.z * (0.70 + 0.55 * v);
+  if (dist < 80.0) {                               // caustics only play over nearby fronds
+    let ca = caustics(wp.xz + vec2<f32>(1.0, 0.4) * u.camPos.w * 0.35, u.camPos.w * 0.55);
+    light += vec3<f32>(0.45, 0.95, 0.90) * ca * u.params0.y * 0.34 * thin * causticVisibility(wp.y, dist);
+  }
+  var col = alb * light;
+  // sparkling specks: round world-anchored dots that pulse, so they twinkle in place
+  // instead of lighting up whole noise cells as flat squares
+  let sp = specks(wp * 6.5 + vec3<f32>(seed * 13.0, seed * 29.0, seed * 7.0), u.camPos.w, 0.20, 0.30);
+  let spark = mix(vec3<f32>(0.72, 1.00, 0.52), vec3<f32>(1.00, 0.82, 0.30), fract(seed * 7.0));
+  col += spark * sp * 1.9 * sstep(95.0, 14.0, dist) * (0.20 + 1.00 * (front + back));
+  // translucent rim: the edge of a blade glows with the up-welling water light, which
+  // is what stops a leaf from reading as a flat cut-out against the haze
+  col += waterTint(max(u.camBasis.z - wp.y, 0.0)) * cube(max(1.0 - abs(dot(n, dir)), 0.0)) * 0.75 * thin;
+  // blades brushing the lens dissolve into the haze instead of smearing a polygon
+  if (dist < 3.2) { col = mix(waterInscat(wp, dir, 0.0), col, sstep(0.45, 3.2, dist)); }
+  return vec4<f32>(fogBlend(col, dist, mix(u.camPos.xyz, wp, 0.5), dir, 0.0), 1.0);
+}
+`;
+
+// ---- props: one instanced hard-matter shader for rock, sponge, coral, wood, stone ----
+// instance layout (16 floats): pos.xyz+scale | rotX rotY rotZ scaleY | tint seed kind extra | bob bobFreq spin pad
+const WGSL_PROP = WGSL_COMMON + `
+fn rot3(p : vec3<f32>, a : vec3<f32>) -> vec3<f32> {
+  // roll, then pitch, then yaw: applying yaw last is what lets a set piece be stood
+  // upright and still be turned to face the camera corridor.
+  var q = p;
+  var c = cos(a.z); var s = sin(a.z);
+  q = vec3<f32>(q.x * c - q.y * s, q.x * s + q.y * c, q.z);
+  c = cos(a.x); s = sin(a.x);
+  q = vec3<f32>(q.x, q.y * c - q.z * s, q.y * s + q.z * c);
+  c = cos(a.y); s = sin(a.y);
+  q = vec3<f32>(q.x * c + q.z * s, q.y, -q.x * s + q.z * c);
+  return q;
+}
+@vertex fn propVS(
+  @location(0) lp : vec3<f32>, @location(1) ln : vec3<f32>,
+  @location(2) i0 : vec4<f32>, @location(3) i1 : vec4<f32>,
+  @location(4) i2 : vec4<f32>, @location(5) i3 : vec4<f32>,
+) -> VSOut {
+  var o : VSOut;
+  let t = u.camPos.w;
+  var local = lp * vec3<f32>(1.0, i1.w, 1.0);
+  var ang = i1.xyz;
+  ang.y += i3.z * t;                                  // slow drift for floating rock
+  var p = rot3(local, ang) * i0.w;
+  p.y += sin(t * i3.y + i2.y * 6.2831) * i3.x;
+  p.y += cos(t * i3.y * 0.63 + i2.y * 4.1) * i3.x * 0.4;
+  let wp = i0.xyz + p;
+  let d = distance(wp, u.camPos.xyz);
+  if (d > u.params0.w) { o.pos = vec4<f32>(0.0, 0.0, 2.0, 1.0); return o; }
+  o.pos = u.viewProj * vec4<f32>(wp, 1.0);
+  o.wpos = vec4<f32>(wp, 0.0);
+  o.nrm = rot3(ln, ang);
+  o.wpos = vec4<f32>(wp, atan2(lp.z, lp.x));           // .w = angle around the mesh axis
+  o.uv = vec2<f32>(i2.z, i2.x);                       // kind, tint
+  o.aux = vec4<f32>(i2.y, i2.w, d, i0.w);             // seed, extra, dist, scale
+  return o;
+}
+fn pal(t : f32, a : vec3<f32>, b : vec3<f32>, c : vec3<f32>, d : vec3<f32>) -> vec3<f32> {
+  return a + b * cos(6.2831853 * (c * t + d));
+}
+@fragment fn propFS(in : VSOut) -> @location(0) vec4<f32> {
+  let wp = in.wpos.xyz;
+  let dist = in.aux.z;
+  let dir = (wp - u.camPos.xyz) / max(dist, 0.001);
+  let seed = in.aux.x; let scale = in.aux.w;
+  let kind = in.uv.x; let tint = in.uv.y;
+  var nd = normalize(in.nrm);
+  let up = max(nd.y, 0.0);
+  if (dot(nd, dir) > 0.0) { nd = -nd; }   // double-sided shading, no culling needed
+  let n = nd;
+
+  var grain = h31(floor(wp * 1.3) + vec3<f32>(seed * 7.0));
+  // cross-fade into the smooth fbm rather than swapping it on at a fixed distance,
+  // which would show up as a ring travelling across the rock as the camera moves
+  if (dist < 58.0) { grain = mix(grain, fbm3(wp * vec3<f32>(0.52, 0.66, 0.52), 3), sstep(58.0, 30.0, dist)); }
+  // rock: a cool basalt base with warm iron-oxide variation, so a boulder field does
+  // not read as one grey material
+  var alb = mix(vec3<f32>(0.070, 0.084, 0.098), vec3<f32>(0.205, 0.222, 0.228), grain);
+  alb = mix(alb, vec3<f32>(0.255, 0.180, 0.130), 0.14 + 0.26 * fract(seed * 3.71));
+  let strata = 0.5 + 0.5 * sin(wp.y * 0.42 + grain * 3.4 + seed * 5.0);
+  alb = mix(alb, vec3<f32>(0.235, 0.255, 0.250), strata * 0.28);
+
+  if (kind > 2.5 && kind < 3.5) {
+    // Barrel sponge: dusty rose to amber, vertically fluted, hollow mouth.
+    // The flute angle comes from the mesh space (in.wpos.w), not world coordinates.
+    let rib = 0.5 + 0.5 * sin(in.wpos.w * 9.0 + seed * 9.0);
+    alb = mix(vec3<f32>(0.145, 0.062, 0.052), vec3<f32>(0.395, 0.205, 0.105), tint * 0.65 + 0.35 * grain);
+    alb *= 0.86 + 0.22 * rib;
+  } else if (kind > 3.5 && kind < 4.5) {
+    // coral: iridescent purple/pink with a mottled polyp pattern
+    let poly = fbm3(wp * vec3<f32>(2.6, 2.6, 2.6), 2);
+    alb = pal(tint * 0.55 + poly * 0.30 + 0.62,
+              vec3<f32>(0.32, 0.10, 0.30), vec3<f32>(0.34, 0.12, 0.26),
+              vec3<f32>(1.00, 0.90, 0.85), vec3<f32>(0.10, 0.32, 0.62));
+    alb *= 0.72 + 0.52 * poly;
+  } else if (kind > 4.5 && kind < 5.5) {
+    // barnacled ship timber: grey-brown planks with pale growth
+    let plank = 0.5 + 0.5 * sin(wp.y * 2.4 + wp.x * 0.5 + seed * 6.0);
+    alb = mix(vec3<f32>(0.085, 0.070, 0.058), vec3<f32>(0.215, 0.180, 0.140), grain);
+    alb = mix(alb, vec3<f32>(0.30, 0.30, 0.26), smoothstep(0.72, 0.98, plank) * 0.55);
+    alb = mix(alb, vec3<f32>(0.24, 0.34, 0.20), smoothstep(0.45, 0.9, fbm3(wp * 0.9, 2)) * 0.35);
+  } else if (kind > 5.5) {
+    // carved stone: pale, banded, encrusted at the base
+    alb = mix(vec3<f32>(0.135, 0.155, 0.175), vec3<f32>(0.34, 0.37, 0.37), grain);
+    alb = mix(alb, vec3<f32>(0.20, 0.30, 0.20), sstep(0.55, 0.05, wp.y + 30.0) * 0.5);
+  }
+  // close-range crackle so large rock and timber do not read as smooth balloons; it
+  // fades out with distance, otherwise the hash aliases into a grey checkerboard on
+  // the far canyon walls
+  alb *= mix(1.0, 0.84 + 0.32 * h31(floor(wp * 3.1) + vec3<f32>(seed * 17.0)), sstep(54.0, 12.0, dist));
+  // magenta encrusting cover: patchy growth that favours quiet upward faces, but with
+  // a 3D boundary so it never paints a clean "pink cap" across the top of a boulder
+  let cov = sstep(0.46, 0.72, fbm2(wp.xz * 0.24 + wp.y * 0.16 + seed * 3.0, 2)) * up * up;
+  alb = mix(alb, vec3<f32>(0.28, 0.050, 0.185), cov * 0.55);
+  // green film in the crevices
+  alb = mix(alb, vec3<f32>(0.11, 0.22, 0.10), sstep(0.35, 0.05, grain) * 0.30);
+
+  let sd = max(dot(n, u.sunDir.xyz), 0.0);
+  // Wrapped sun term: a face a little away from the sun still catches scattered light,
+  // so boulders keep their form instead of turning into black cut-outs when backlit.
+  let wsd = pow(clamp(dot(n, u.sunDir.xyz) * 0.5 + 0.5, 0.0, 1.0), 1.5);
+  let skyUp = 0.5 + 0.5 * n.y;
+  // Rock sits inside a bright blue light dome: sun overhead, glowing water all round
+  // and a magenta bounce off the cover.
+  var light = u.sunColor.rgb * u.sunDir.w * (sd * 0.42 + wsd * 0.34)
+            + waterTint(max(u.camBasis.z - wp.y, 0.0)) * u.params0.z * (1.45 + 0.80 * skyUp)
+            + vec3<f32>(0.10, 0.028, 0.062) * u.params0.z * (1.0 - skyUp);
+  if (dist < 85.0) {
+    let ca = caustics(wp.xz + vec2<f32>(1.0, 0.4) * u.camPos.w * 0.35, u.camPos.w * 0.55);
+    light += vec3<f32>(0.42, 0.92, 0.95) * ca * u.params0.y * 0.42 * up * causticVisibility(wp.y, dist);
+  }
+  var col = alb * light * (0.80 + 0.34 * grain);
+  // iridescent sheen on coral and carved stone
+  if (kind > 3.5) {
+    let fres = cube(max(1.0 - max(dot(n, -dir), 0.0), 0.0));
+    col += pal(fres * 0.8 + tint + u.camPos.w * 0.02,
+               vec3<f32>(0.30, 0.16, 0.36), vec3<f32>(0.30, 0.20, 0.24),
+               vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(0.30, 0.55, 0.75)) * fres * 0.30;
+  }
+  return vec4<f32>(fogBlend(col, dist, mix(u.camPos.xyz, wp, 0.5), dir, 0.0), 1.0);
+}
+`;
+
+// ---- animated life: marine snow, bubbles, fish schools, manta rays ----
+// Everything moves in the vertex shader from u.camPos.w (time) plus a per-instance
+// seed, so a frame costs no CPU work and no buffer uploads beyond the uniforms.
+const WGSL_LIFE = WGSL_COMMON + `
+struct LS {
+  @builtin(position) pos : vec4<f32>,
+  @location(0) uv : vec2<f32>,
+  @location(1) dat : vec4<f32>,   // dist, alpha, extinction, tint
+  @location(2) kind : f32,
+};
+struct Inst { p : vec4<f32>, q : vec4<f32>, r : vec4<f32> };
+@group(0) @binding(1) var<storage, read> inst : array<Inst>;
+// infinite-but-bounded cloud: fold the position back into a box centred on the camera
+fn wrapBox(p : vec3<f32>, cam : vec3<f32>, size : vec3<f32>) -> vec3<f32> {
+  let h = size * 0.5;
+  let d = p - cam + h;
+  return cam + d - size * floor(d / size) - h;
+}
+@vertex fn moteVS(@builtin(vertex_index) vi : u32, @builtin(instance_index) ii : u32) -> LS {
+  var o : LS;
+  let i0 = inst[ii].p; let i1 = inst[ii].q; let i2 = inst[ii].r;
+  let t = u.camPos.w; let seed = i0.w;
+  let bub = step(0.5, i2.x);                    // 1 = bubble, 0 = marine snow
+  var p = i0.xyz;
+  p.y += t * mix(-0.30 - 0.35 * fract(seed * 3.7), 2.2 + 3.4 * fract(seed * 5.1), bub);
+  let sway = mix(0.9, 0.55, bub) * i1.z;
+  p.x += sin(t * mix(0.33, 1.15, bub) + seed * 6.2831) * sway;
+  p.z += cos(t * mix(0.29, 0.95, bub) + seed * 4.7) * sway;
+  p = wrapBox(p, u.camPos.xyz, vec3<f32>(i2.y, i2.y * 0.62, i2.y));
+  // keep bubbles under the surface, and never let a mote crowd the lens
+  var alpha = i1.y * smoothstep(1.1, 3.4, distance(p, u.camPos.xyz));
+  alpha *= mix(1.0, smoothstep(2.0, 14.0, u.camBasis.z - p.y), bub);
+  alpha *= mix(0.75 + 0.25 * sin(t * (1.1 + seed * 2.3) + seed * 31.0), 1.0, bub);
+  let cp = u.viewProj * vec4<f32>(p, 1.0);
+  let d = cp.w;                                   // depth along the view axis
+  if (!(d >= 1.2)) {                              // behind the lens, or so close that
+    o.pos = vec4<f32>(0.0, 0.0, 2.0, 1.0);        // the sprite is only haze: drop it
+    o.uv = vec2<f32>(4.0, 4.0); o.dat = vec4<f32>(0.0); o.kind = bub; return o;
+  }
+  let el = mix(1.0, 1.34, bub);
+  let cs = vec2<f32>(f32(i32(vi & 1u) * 2 - 1), f32(i32((vi >> 1u) & 1u) * 2 - 1));
+  let rad = i1.x * 0.5;
+  // expand the sprite in view space straight into clip units (proj00 = 1/(tan*asp))
+  let th = u.camBasis.w;
+  let asp = u.screen.x / u.screen.y;
+  o.pos = cp + vec4<f32>(cs.x * rad / (th * asp), cs.y * rad * el / th, 0.0, 0.0);
+  o.uv = cs;
+  o.dat = vec4<f32>(d, alpha, exp(-0.0125 * d), i1.w);
+  o.kind = bub;
+  return o;
+}
+@fragment fn moteFS(i : LS) -> @location(0) vec4<f32> {
+  let r = length(i.uv);
+  if (r > 1.0) { discard; }
+  let core = exp(-r * r * 3.4);
+  // (not pow): the base goes negative inside the ring, and pow() with a negative base
+  // is undefined in WGSL - it poisoned these sprites with NaN, which tonemaps to black.
+  let dr = (r - 0.80) * 7.5; let rim = exp(-dr * dr);
+  let dg = (r - 0.36) * 5.0; let glass = exp(-dg * dg) * 0.35;
+  let shape = mix(core, (rim * 0.85 + glass * 0.6) * (1.0 - core * 0.55), i.kind);
+  var col = mix(vec3<f32>(0.62, 0.88, 0.86), vec3<f32>(0.80, 0.97, 1.00), i.dat.w);
+  col = mix(col, vec3<f32>(0.95, 1.00, 1.00), i.kind * 0.5);
+  let a = shape * i.dat.y * i.dat.z * mix(0.55, 0.95, i.kind);
+  var v = col * a;
+  let s = v.x + v.y + v.z;                        // NaN or blow-up in any channel
+  if (!(s >= 0.0) || !(s < 4.0e4)) { discard; }   // would otherwise punch a black hole
+  return vec4<f32>(v, 1.0);
+}
+// ---- fish: instanced lofted body, tail beat and school path in the vertex shader ----
+@vertex fn fishVS(@location(0) lp : vec3<f32>, @location(1) ln : vec3<f32>,
+                  @builtin(instance_index) ii : u32) -> VSOut {
+  var o : VSOut;
+  let i0 = inst[ii].p; let i1 = inst[ii].q; let i2 = inst[ii].r;
+  let t = u.camPos.w;
+  let sc = i2.x; let spd = i2.w;
+  let a = t * spd + sc * 6.2831;
+  let rr = 13.0 + 30.0 * fract(sc * 0.618);
+  let dyv = 5.5 * sin(a * 0.63 + sc * 3.1);
+  var wp = i0.xyz + vec3<f32>(cos(a) * rr + i1.x, dyv + i1.y, sin(a) * rr + i1.z);
+  wp.y = min(wp.y, u.camBasis.z - 7.0);             // never breach the surface
+  // oriented basis from the path tangent
+  let fwd = normalize(vec3<f32>(-sin(a) * rr, 5.5 * 0.63 * cos(a * 0.63 + sc * 3.1), cos(a) * rr));
+  let rt = normalize(cross(vec3<f32>(0.0, 1.0, 0.0), fwd));
+  let up = cross(fwd, rt);
+  // tail beat: lateral sweep that grows toward the tail, phase travelling aft
+  let beat = sin(t * 9.0 + i1.w * 6.2831 + lp.z * 5.2) * 0.26 * smoothstep(-0.35, 0.55, lp.z);
+  var l = lp * i0.w;
+  l.x += beat * (lp.z + 0.4);
+  var q = rt * l.x + up * l.y + fwd * l.z;
+  wp += q;
+  let d = distance(wp, u.camPos.xyz);
+  if (d > u.params0.w) { o.pos = vec4<f32>(0.0, 0.0, 2.0, 1.0); return o; }
+  o.pos = u.viewProj * vec4<f32>(wp, 1.0);
+  o.wpos = vec4<f32>(wp, 0.0);
+  o.nrm = normalize(rt * ln.x + up * ln.y + fwd * ln.z);
+  o.uv = vec2<f32>(i2.z, i2.y);                      // species, tint
+  o.aux = vec4<f32>(i1.w, i0.w, d, lp.z);            // phase, size, dist, chord
+  return o;
+}
+@fragment fn fishFS(in : VSOut) -> @location(0) vec4<f32> {
+  let wp = in.wpos.xyz;
+  let dist = in.aux.z;
+  let dir = (wp - u.camPos.xyz) / max(dist, 0.001);
+  var nd = normalize(in.nrm);
+  if (dot(nd, dir) > 0.0) { nd = -nd; }
+  let species = in.uv.x; let tint = in.uv.y;
+  let chord = in.aux.w;
+  // countershaded body: dark back, pale belly, one bright flank stripe
+  let belly = 0.5 + 0.5 * nd.y;
+  var alb = mix(vec3<f32>(0.090, 0.140, 0.185), vec3<f32>(0.48, 0.56, 0.61), belly * belly);
+  alb = mix(alb, mix(vec3<f32>(0.34, 0.48, 0.59), vec3<f32>(0.70, 0.56, 0.26), species), 0.42);
+  alb = mix(alb, vec3<f32>(0.78, 0.83, 0.86), smoothstep(0.55, 1.0, 1.0 - abs(nd.y)) * 0.32);
+  alb *= 0.85 + 0.30 * h31(floor(wp * 9.0) + vec3<f32>(tint * 13.0));
+  let sd = max(dot(nd, u.sunDir.xyz), 0.0);
+  var light = u.sunColor.rgb * u.sunDir.w * sd * 0.60
+            + waterTint(max(u.camBasis.z - wp.y, 0.0)) * u.params0.z * (1.15 + 1.10 * (0.5 + 0.5 * nd.y));
+  // silvered flash: fish read as flickers of light, so lean into the specular
+  let hlf = normalize(u.sunDir.xyz - dir);
+  let spec = pow(max(dot(nd, hlf), 0.0), 26.0);
+  var col = alb * light + u.sunColor.rgb * spec * 1.3;
+  // scale shimmer travelling along the flank
+  col += u.sunColor.rgb * 0.20 * smoothstep(0.55, 1.0,
+         sin(u.camPos.w * 3.0 + tint * 12.0 + chord * 9.0)) * (1.0 - abs(nd.y));
+  return vec4<f32>(fogBlend(col, dist, mix(u.camPos.xyz, wp, 0.5), dir, 0.0), 1.0);
+}
+// ---- manta: wide lofted wing, flapping and banked along a slow circuit ----
+@vertex fn mantaVS(@location(0) lp : vec3<f32>, @location(1) ln : vec3<f32>,
+                   @builtin(instance_index) ii : u32) -> VSOut {
+  var o : VSOut;
+  let i0 = inst[ii].p; let i1 = inst[ii].q; let i2 = inst[ii].r;
+  let t = u.camPos.w;
+  let ph = i1.x; let spd = i2.x;
+  let a = t * spd + ph * 6.2831;
+  let rr = i2.y;
+  let climb = 9.0 * sin(a * 0.47 + ph * 2.2);
+  var wp = i0.xyz + vec3<f32>(cos(a) * rr, climb + i1.z, sin(a) * rr);
+  wp.y = min(wp.y, u.camBasis.z - 12.0);
+  let fwd = normalize(vec3<f32>(-sin(a) * rr, 9.0 * 0.47 * cos(a * 0.47 + ph * 2.2), cos(a) * rr));
+  let rt0 = normalize(cross(vec3<f32>(0.0, 1.0, 0.0), fwd));
+  // bank into the turn, then flap the wings about the span axis
+  let bank = -0.42;
+  let cb = cos(bank); let sb = sin(bank);
+  let up0 = normalize(cross(fwd, rt0));
+  let rt = rt0 * cb + up0 * sb;
+  let up = up0 * cb - rt0 * sb;
+  let spanA = abs(lp.x);
+  let flap = sin(t * 1.25 + ph * 6.2831 - spanA * 1.9) * 0.42 * pow(spanA, 1.5);
+  var l = lp * i0.w;
+  l.y += flap;
+  wp += rt * l.x + up * l.y + fwd * l.z;
+  let d = distance(wp, u.camPos.xyz);
+  if (d > u.params0.w) { o.pos = vec4<f32>(0.0, 0.0, 2.0, 1.0); return o; }
+  o.pos = u.viewProj * vec4<f32>(wp, 1.0);
+  o.wpos = vec4<f32>(wp, 0.0);
+  o.nrm = normalize(rt * ln.x + up * ln.y + fwd * ln.z);
+  o.uv = vec2<f32>(spanA, lp.z);
+  o.aux = vec4<f32>(i2.z, i0.w, d, i1.y);            // tint, size, dist, mark
+  return o;
+}
+@fragment fn mantaFS(in : VSOut) -> @location(0) vec4<f32> {
+  let wp = in.wpos.xyz;
+  let dist = in.aux.z;
+  let dir = (wp - u.camPos.xyz) / max(dist, 0.001);
+  var nd = normalize(in.nrm);
+  let backSide = dot(nd, dir) > 0.0;
+  if (backSide) { nd = -nd; }
+  let tint = in.aux.x;
+  // dorsal side: charcoal with pale blotches; ventral side: cream with dark tips
+  let mott = fbm2(wp.xz * 0.55 + vec2<f32>(in.aux.y * 3.0), 3);
+  var alb = mix(vec3<f32>(0.030, 0.048, 0.070), vec3<f32>(0.115, 0.150, 0.185), mott);
+  alb = mix(alb, vec3<f32>(0.34, 0.38, 0.42), smoothstep(0.62, 0.95, mott) * 0.55);
+  if (!backSide) { alb = mix(vec3<f32>(0.30, 0.33, 0.34), vec3<f32>(0.52, 0.55, 0.55), mott); }
+  let sd = max(dot(nd, u.sunDir.xyz), 0.0);
+  // the underside glowing with light bounced up from the sand is what sells a manta
+  let upw = waterTint(max(u.camBasis.z - wp.y, 0.0)) * u.params0.z;
+  var light = u.sunColor.rgb * u.sunDir.w * sd * 0.62
+            + upw * (1.10 + 0.95 * (0.5 + 0.5 * nd.y));
+  var col = alb * light;
+  let fres = cube(max(1.0 - max(dot(nd, -dir), 0.0), 0.0));
+  col += upw * fres * 0.75;
+  // a wingtip brushing the lens should veil the water, not stamp a black polygon over it
+  if (dist < 5.0) { col = mix(waterInscat(wp, dir, 0.0), col, sstep(0.6, 5.0, dist)); }
+  return vec4<f32>(fogBlend(col, dist, mix(u.camPos.xyz, wp, 0.5), dir, 0.0), 1.0);
+}
+`;
+
+const WGSL_POST = WGSL_COMMON + `
+@group(0) @binding(1) var samp : sampler;
+@group(0) @binding(2) var hdrTex : texture_2d<f32>;
+@group(0) @binding(3) var depthTex : texture_depth_multisampled_2d;
+@group(0) @binding(4) var texA : texture_2d<f32>;
+@group(0) @binding(5) var texB : texture_2d<f32>;
+
+fn viewDepth(z : f32) -> f32 {
+  return u.params1.x * u.params1.y / max(u.params1.y - z * (u.params1.y - u.params1.x), 1e-4);
+}
+fn rayDirAt(uv : vec2<f32>) -> vec3<f32> {
+  let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  let vp = vec3<f32>(ndc.x * u.camBasis.w * (u.screen.x / u.screen.y), ndc.y * u.camBasis.w, -1.0);
+  return normalize(vec3<f32>(dot(u.view[0].xyz, vp), dot(u.view[1].xyz, vp), dot(u.view[2].xyz, vp)));
+}
+// Screen-space volumetric shafts: march toward the sun through a slowly drifting
+// cloud whose cells are the light beams. Stepping stops at the visible surface,
+// so shafts sit in front of kelp and rock instead of veiling them.
+@fragment fn raysFS(i : PVS) -> @location(0) vec4<f32> {
+  let dir = rayDirAt(i.uv);
+  let sd = max(dot(dir, u.sunDir.xyz), 0.0);
+  let ds = vec2<f32>(textureDimensions(depthTex));
+  let dz = textureLoad(depthTex, vec2<i32>(i.uv * ds), 0);
+  let far = min(viewDepth(dz) * 0.98, u.params3.w);
+  let steps = i32(u.params3.z);
+  let dt = far / f32(steps);
+  let drift = u.camPos.w * 0.055;
+  let ab = dot(u.absorb.xyz, vec3<f32>(0.32, 0.34, 0.34));
+  var acc = 0.0;
+  var t = dt * 0.5;
+  for (var k = 0; k < 32; k = k + 1) {
+    if (k >= steps) { break; }
+    let p = u.camPos.xyz + dir * t;
+    // beam cross-section follows the horizontal offset from the sun axis,
+    // stretched vertically so the cells read as columns of light
+    let q = vec2<f32>(p.x + u.sunDir.x * p.y * 0.22, p.z + u.sunDir.z * p.y * 0.22) * 0.021;
+    var m = fbm2(q + vec2<f32>(drift, -drift * 0.63), 2);
+    m = smoothstep(0.455, 0.665, m);               // narrow beams, wide quiet gaps
+    m = m * m * (3.0 - 2.0 * m);                   // second ease: crisp shaft edges
+    let near = (1.0 - exp(-t * 0.10)) * exp(-t * 0.009);   // no veil right in front of the eye
+    acc += m * exp(-t * ab * 0.6) * near * dt;
+    t += dt;
+  }
+  // acc is an integral in metres; the scattering coefficient turns it into radiance
+  let shaft = acc * 0.0165 * (0.20 + 1.85 * pow(sd, 2.0));
+  // broad halo plus a blown-out sun disc seen through the water column
+  let sky = pow(sd, 6.0) * 0.30 + pow(sd, 130.0) * 2.2;
+  return vec4<f32>(u.sunColor.rgb * (shaft + sky) * u.params1.z, 1.0);
+}
+// 13-tap wide separable blur; one entry point per axis
+fn blurTaps(px : vec2<f32>, d : vec2<f32>) -> vec4<f32> {
+  var c = textureSampleLevel(texA, samp, px, 0.0) * 0.1541;
+  c += (textureSampleLevel(texA, samp, px + d, 0.0) + textureSampleLevel(texA, samp, px - d, 0.0)) * 0.1485;
+  c += (textureSampleLevel(texA, samp, px + d * 2.5, 0.0) + textureSampleLevel(texA, samp, px - d * 2.5, 0.0)) * 0.1068;
+  c += (textureSampleLevel(texA, samp, px + d * 4.5, 0.0) + textureSampleLevel(texA, samp, px - d * 4.5, 0.0)) * 0.0536;
+  return c;
+}
+@fragment fn blurHFS(i : PVS) -> @location(0) vec4<f32> {
+  let ts = vec2<f32>(textureDimensions(texA));
+  return blurTaps(i.uv, vec2<f32>(1.0, 0.0) / ts);
+}
+@fragment fn blurVFS(i : PVS) -> @location(0) vec4<f32> {
+  let ts = vec2<f32>(textureDimensions(texA));
+  return blurTaps(i.uv, vec2<f32>(0.0, 1.0) / ts);
+}
+// downsample + soft-knee bright pass for bloom
+@fragment fn brightFS(i : PVS) -> @location(0) vec4<f32> {
+  let o = 0.75 / vec2<f32>(textureDimensions(hdrTex));
+  var c = textureSampleLevel(hdrTex, samp, i.uv + vec2<f32>(-o.x, -o.y), 0.0).rgb;
+  c += textureSampleLevel(hdrTex, samp, i.uv + vec2<f32>(o.x, -o.y), 0.0).rgb;
+  c += textureSampleLevel(hdrTex, samp, i.uv + vec2<f32>(-o.x, o.y), 0.0).rgb;
+  c += textureSampleLevel(hdrTex, samp, i.uv + vec2<f32>(o.x, o.y), 0.0).rgb;
+  c *= 0.25;
+  let l = max(max(c.r, c.g), c.b);
+  let k = max(l - u.params2.x, 0.0) / max(l, 1e-4);
+  return vec4<f32>(c * k * k, 1.0);
+}
+@fragment fn compositeFS(i : PVS) -> @location(0) vec4<f32> {
+  var c = textureSampleLevel(hdrTex, samp, i.uv, 0.0).rgb;
+  let rayC = textureSampleLevel(texA, samp, i.uv, 0.0).rgb;
+  let bloomC = textureSampleLevel(texB, samp, i.uv, 0.0).rgb;
+  // ?diag=1 paints the poison instead of hiding it: red = NaN/huge in the scene buffer,
+  // green = god-ray buffer, blue = bloom buffer.
+  if (u.params4.x > 0.5) {
+    let bad = vec3<f32>(poison(c), poison(rayC), poison(bloomC));
+    return vec4<f32>(bad, 1.0);
+  }
+  c += rayC;
+  c += bloomC * u.params2.y;
+  c = c * u.params0.x;
+  let vd = distance(i.uv, vec2<f32>(0.5, 0.5));
+  c = c * (1.0 - u.params2.z * pow(clamp(vd * 1.30, 0.0, 1.0), 2.3));
+  c = aces(c);
+  // gentle per-channel S-curve: keeps the water soft but gives sunlight some bite
+  c = mix(c, c * c * (3.0 - 2.0 * c), u.params2.w);
+  // fantasy grade: keep the blues alive, add a touch of warmth to highlights
+  let l = luma3(c);
+  c = mix(vec3<f32>(l), c, vec3<f32>(1.06, 1.0, 0.98)) * vec3<f32>(0.99, 1.005, 1.03);
+  c += (c - l) * 0.10;
+  c += (sdHash2(floor(i.pos.xy) + 0.37) - 0.5) * (1.0 / 255.0);
+  return vec4<f32>(srgbEnc(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0))), 1.0);
+}
+`;
+
+// ============================ procedural geometry ============================
+// Layout: interleaved [px,py,pz, nx,ny,nz, ...] - callers pass the stride.
+function makeGeo(verts, idx) {
+  return { verts, idx };
+}
+function buildGround(n, half) {
+  const stride = 6;
+  const nv = (n + 1) * (n + 1);
+  const verts = new Float32Array(nv * stride);
+  const eps = 0.8;
+  let o = 0;
+  for (let j = 0; j <= n; j++) {
+    const z = -half + (2 * half * j) / n;
+    for (let i = 0; i <= n; i++) {
+      const x = -half + (2 * half * i) / n;
+      const y = bedHeight(x, z);
+      const hx = (bedHeight(x - eps, z) - bedHeight(x + eps, z));
+      const hz = (bedHeight(x, z - eps) - bedHeight(x, z + eps));
+      let nx = hx, ny = 2 * eps, nz = hz;
+      const il = 1 / Math.hypot(nx, ny, nz);
+      verts[o++] = x; verts[o++] = y; verts[o++] = z;
+      verts[o++] = nx * il; verts[o++] = ny * il; verts[o++] = nz * il;
+    }
+  }
+  const idx = new Uint32Array(n * n * 6);
+  let k = 0;
+  for (let j = 0; j < n; j++) {
+    for (let i = 0; i < n; i++) {
+      const a = j * (n + 1) + i, b = a + 1, c = a + (n + 1), d = c + 1;
+      idx[k++] = a; idx[k++] = c; idx[k++] = b;
+      idx[k++] = b; idx[k++] = c; idx[k++] = d;
+    }
+  }
+  return makeGeo(verts, idx);
+}
+// exponential radial disc: dense near the middle, sparse at the horizon
+function buildDisc(rings, sectors, r0, r1) {
+  const stride = 3;
+  const nv = (rings + 1) * (sectors + 1);
+  const verts = new Float32Array(nv * stride);
+  let o = 0;
+  for (let j = 0; j <= rings; j++) {
+    const r = r0 * Math.pow(r1 / r0, j / rings);
+    for (let i = 0; i <= sectors; i++) {
+      const a = (i / sectors) * Math.PI * 2;
+      verts[o++] = Math.cos(a) * r; verts[o++] = 0; verts[o++] = Math.sin(a) * r;
+    }
+  }
+  const idx = new Uint32Array(rings * sectors * 6);
+  let k = 0;
+  for (let j = 0; j < rings; j++) {
+    for (let i = 0; i < sectors; i++) {
+      const a = j * (sectors + 1) + i, b = a + 1, c = a + (sectors + 1), d = c + 1;
+      idx[k++] = a; idx[k++] = c; idx[k++] = b;
+      idx[k++] = b; idx[k++] = c; idx[k++] = d;
+    }
+  }
+  return makeGeo(verts, idx);
+}
+// One kelp stalk: a faceted stipe plus blades twisted around it.
+// Local space: y in 0..1 (holdfast -> tip), x/z in "radius units" - the vertex
+// shader scales them by the per-instance radius, so one mesh serves every size.
+function buildKelpMesh(rng) {
+  const verts = [], idx = [];
+  let vi = 0;
+  const push = (x, y, z, nx, ny, nz, u, v) => { verts.push(x, y, z, nx, ny, nz, u, v); };
+  // stipe: thin faceted column, tapering up
+  const S = 4, SR = 8;
+  for (let j = 0; j <= SR; j++) {
+    const v = j / SR, r = 0.075 * (1 - 0.55 * v) + 0.012;
+    for (let i = 0; i <= S; i++) {
+      const a = (i / S) * 6.2831853, ca = Math.cos(a), sa = Math.sin(a);
+      push(ca * r, v, sa * r, ca, 0.1, sa, i / S, v);
+    }
+  }
+  for (let j = 0; j < SR; j++) for (let i = 0; i < S; i++) {
+    const a = vi + j * (S + 1) + i, b = a + 1, c = a + (S + 1), d = c + 1;
+    idx.push(a, c, b, b, c, d);
+  }
+  vi += (SR + 1) * (S + 1);
+  // Giant kelp is a bare column with a canopy: the fronds are attached to the top third
+  // and float upward, which is what opens the understory up for the camera to fly
+  // through. Radial extents are in "radius units" (the VS multiplies by the instance
+  // radius, 2.4-4.0, so 1 unit ~ 3 m); y is a fraction of the 25-60 m stalk height.
+  const nodes = CFG.kelpNodes, ROWS = 5;
+  for (let nd = 0; nd < nodes; nd++) {
+    const t0 = 0.52 + 0.46 * Math.pow(nd / (nodes - 1), 0.8);    // bare column, leafy crown
+    const crown = 1 + 0.55 * smoothstep(0.60, 1.0, t0);
+    const perNode = t0 > 0.58 ? 3 : 2;
+    for (let k = 0; k < perNode; k++) {
+      const ang = nd * 2.399963 + k * (6.2831853 / perNode) + (rng() - 0.5) * 0.55;
+      const ca = Math.cos(ang), sa = Math.sin(ang), tx = -sa, tz = ca;
+      const len = (1.02 + 0.46 * rng()) * crown;
+      const wid = (0.17 + 0.09 * rng()) * (0.85 + 0.25 * crown);
+      const v0 = clamp(t0 - 0.03 + 0.03 * rng(), 0, 0.96);
+      const rise = 0.026 + 0.022 * rng();        // fronds float up toward the surface
+      const droop = 0.008 + 0.014 * rng();       // ... easing off near the tip
+      const twist = (rng() - 0.5) * 0.9;         // ribbon twist along the length
+      const off = 0.05;
+      for (let j = 0; j <= ROWS; j++) {
+        const t = j / ROWS;
+        const rad = off + len * t;
+        const w = wid * Math.sin(Math.PI * Math.min(1, 0.18 + t * 0.9)) * (1 - 0.42 * t);
+        const y = v0 + rise * t - droop * Math.pow(t, 2.2);
+        const px = ca * rad, pz = sa * rad;
+        const roll = twist * t;                  // roll the ribbon about its own axis
+        const rcos = Math.cos(roll), rsin = Math.sin(roll);
+        const ny1 = 0.45 * rcos + 0.55, ny2 = ny1;
+        push(px - tx * w * rcos, y + w * rsin * 0.5, pz - tz * w * rcos, ca * 0.35, ny1, sa * 0.35, 0, v0 + t * 0.05);
+        push(px + tx * w * rcos, y - w * rsin * 0.5, pz + tz * w * rcos, ca * 0.35, ny2, sa * 0.35, 1, v0 + t * 0.05);
+      }
+      for (let j = 0; j < ROWS; j++) {
+        const a = vi + j * 2, b2 = a + 1, c = a + 2, d = a + 3;
+        idx.push(a, c, b2, b2, c, d);
+      }
+      vi += (ROWS + 1) * 2;
+    }
+  }
+  return makeGeo(new Float32Array(verts), new Uint32Array(idx));
+}
+// Kelp forest: stratised random over the canyon corridor, thinned on steep rock.
+// Layout per instance (12 floats): base xyz + height | radius phase tint seed | leanX leanZ twist kind
+function bedSlope(x, z) {
+  const e = 1.6;
+  const hx = bedHeight(x - e, z) - bedHeight(x + e, z);
+  const hz = bedHeight(x, z - e) - bedHeight(x, z + e);
+  return 1 - (2 * e) / Math.hypot(hx, 2 * e, hz);
+}
+function placeFlora(rng) {
+  const half = CFG.groundHalf - 16;
+  const out = new Float32Array(12 * CFG.kelpMax);
+  const step = 3.1, hw = 96;
+  const sx0 = CFG.startPos[0], sz0 = CFG.startPos[2];
+  let n = 0;
+  for (let z = -half; z <= half; z += step) {
+    for (let d = -hw; d <= hw; d += step) {
+      if (n >= CFG.kelpMax) break;
+      const zz = z + (rng() - 0.5) * step * 1.6;
+      const xx = canyonCenter(zz) + d + (rng() - 0.5) * step * 1.6;
+      const dd = Math.abs(xx - canyonCenter(zz));
+      if (dd > hw) continue;
+      const dens = fbm2(xx * 0.017 + 5.5, zz * 0.017 - 2.5, 3);
+      let p = (dens - 0.30) * 2.1;                   // patches, not a solid wall
+      p *= 1 - smoothstep(hw * 0.72, hw, dd);         // thin out toward the walls
+      // open water corridor down the middle of the canyon: the camera flies through
+      // it, so the forest has to be seen from inside rather than as a wall of stipes
+      p *= 0.20 + 1.15 * smoothstep(11, 48, dd);
+      // keep an open pool around the entry point so the first view reads as a forest
+      p *= smoothstep(9, 44, Math.hypot(xx - sx0, zz - sz0));
+      if (rng() > p) continue;
+      const slope = bedSlope(xx, zz);
+      if (slope > 0.55) continue;
+      const bed = bedHeight(xx, zz);
+      const room = CFG.surfaceY - bed - 7;
+      if (room < 16) continue;
+      let h = room * (0.80 + 0.20 * rng());      // canopy just under the surface
+      if (rng() < 0.17) h *= 0.42 + 0.28 * rng(); // juveniles give the forest layers
+      if (h < 12) continue;
+      const o = n * 12;
+      out[o + 0] = xx; out[o + 1] = bed - 0.6; out[o + 2] = zz; out[o + 3] = h;
+      out[o + 4] = (2.45 + 1.55 * rng()) * (0.80 + 0.40 * h / 70);
+      out[o + 5] = rng() * 6.2831853;
+      out[o + 6] = clamp(0.12 + 0.95 * rng() * rng() + (h / room - 0.5) * 0.25, 0, 1);
+      out[o + 7] = rng();
+      out[o + 8] = (rng() - 0.5) * 0.5; out[o + 9] = (rng() - 0.5) * 0.5;
+      out[o + 10] = 0.7 + 2.1 * rng(); out[o + 11] = 0;
+      n++;
+    }
+  }
+  return { data: out, n };
+}
+// ---------------- prop meshes (built once, instanced) ----------------
+// Appends a swept, tapered tube along pathFn(u) -> [x,y,z], radius radFn(u).
+function sweep(verts, idx, pathFn, radFn, segs, sides, capStart, capEnd) {
+  const base = verts.length / 6;
+  for (let j = 0; j <= segs; j++) {
+    const u = j / segs, p = pathFn(u);
+    const u2 = Math.min(1, u + 0.02), u1 = Math.max(0, u - 0.02);
+    const a2 = pathFn(u2), a1 = pathFn(u1);
+    let tx = a2[0] - a1[0], ty = a2[1] - a1[1], tz = a2[2] - a1[2];
+    let l = Math.hypot(tx, ty, tz) || 1; tx /= l; ty /= l; tz /= l;
+    let ux = 0, uy = 1, uz = 0;
+    if (Math.abs(ty) > 0.94) { ux = 1; uy = 0; uz = 0; }
+    let b1x = ty * uz - tz * uy, b1y = tz * ux - tx * uz, b1z = tx * uy - ty * ux;
+    l = Math.hypot(b1x, b1y, b1z) || 1; b1x /= l; b1y /= l; b1z /= l;
+    const b2x = ty * b1z - tz * b1y, b2y = tz * b1x - tx * b1z, b2z = tx * b1y - ty * b1x;
+    const r = radFn(u);
+    for (let i = 0; i <= sides; i++) {
+      const an = (i / sides) * 6.2831853, ca = Math.cos(an), sa = Math.sin(an);
+      const nx = b1x * ca + b2x * sa, ny = b1y * ca + b2y * sa, nz = b1z * ca + b2z * sa;
+      verts.push(p[0] + nx * r, p[1] + ny * r, p[2] + nz * r,
+                 nx * 0.75 + tx * 0.25, ny * 0.75 + ty * 0.25, nz * 0.75 + tz * 0.25);
+    }
+  }
+  const RS = sides + 1;
+  for (let j = 0; j < segs; j++) for (let i = 0; i < sides; i++) {
+    const a = base + j * RS + i, b = a + 1, c = a + RS, d = c + 1;
+    idx.push(a, c, b, b, c, d);
+  }
+  const cap = (u, sgn) => {
+    const ci = verts.length / 6, p = pathFn(u);
+    verts.push(p[0], p[1] + sgn * 0.001, p[2], 0, sgn, 0);
+    const ring = u === 0 ? base : base + segs * RS;
+    for (let i = 0; i < sides; i++) {
+      const a = ring + i, b = a + 1;
+      if (sgn > 0) idx.push(ci, a, b); else idx.push(ci, b, a);
+    }
+  };
+  if (capStart) cap(0, -1);
+  if (capEnd) cap(1, 1);
+}
+// Lumpy ball: use radius noise so boulders look hewn rather than round.
+function buildRockBall(rng, rings, sectors, amp, freq) {
+  const verts = [], idx = [];
+  // two radius octaves: a big lumpy form plus medium facets, so boulders look hewn
+  // rather than like smooth spheres
+  const rad = (dx, dy, dz) => 1 + 1.0 * (amp * (fbm3s(dx * freq, dy * freq, dz * freq) - 0.5) * 2
+    + amp * 0.40 * (fbm3s(dx * freq * 2.9 + 5.3, dy * freq * 2.9 - 3.1, dz * freq * 2.9 + 7.7) - 0.5) * 2)
+                               + amp * 0.35 * (fbm3s(dx * freq * 3.3 + 5.5, dy * freq * 3.1 - 2.2,
+                                                     dz * freq * 2.9 + 8.8) - 0.5) * 2;
+  const at = (i, j) => {
+    const ph = (i / sectors) * 6.2831853, th = (j / rings) * Math.PI;
+    const st = Math.sin(th);
+    const dx = st * Math.cos(ph), dy = Math.cos(th), dz = st * Math.sin(ph);
+    const r = rad(dx, dy, dz);
+    return [dx * r, dy * r, dz * r];
+  };
+  // A star-shaped body has a reliable outward normal in its own position vector, and
+  // it keeps the facet-free look the derivative estimate loses on a lumpy surface.
+  for (let j = 0; j <= rings; j++) for (let i = 0; i <= sectors; i++) {
+    const p = at(i, j);
+    const l = Math.hypot(p[0], p[1], p[2]) || 1;
+    verts.push(p[0], p[1], p[2], p[0] / l, p[1] / l, p[2] / l);
+  }
+  for (let j = 0; j < rings; j++) for (let i = 0; i < sectors; i++) {
+    const a = j * (sectors + 1) + i, b = a + 1, c = a + sectors + 1, d = c + 1;
+    idx.push(a, c, b, b, c, d);
+  }
+  return makeGeo(new Float32Array(verts), new Uint32Array(idx));
+}
+// Cheap 3-octave value noise in 3D for mesh building (JS side).
+function fbm3s(x, y, z) {
+  let s = 0, amp = 0.5, norm = 0, fx = x, fy = y, fz = z;
+  for (let i = 0; i < 3; i++) {
+    const xi = Math.floor(fx), yi = Math.floor(fy), zi = Math.floor(fz);
+    const u = fx - xi, v = fy - yi, w = fz - zi;
+    const h = (a, b, c) => {
+      let n = Math.imul(a, 127) + Math.imul(b, 311) + Math.imul(c, 733);
+      n = Math.imul(n ^ (n >>> 15), 0x2c1b3c6d);
+      return ((n ^ (n >>> 12)) >>> 0) / 4294967296;
+    };
+    const su = u * u * (3 - 2 * u), sv = v * v * (3 - 2 * v), sw = w * w * (3 - 2 * w);
+    const l = (p, q, r) => p + (q - p) * sw;
+    const m = (p, q) => l(p, q, 0) + (l(q, p, 0) - l(p, q, 0)) * 0;
+    const c00 = h(xi, yi, zi), c10 = h(xi + 1, yi, zi), c01 = h(xi, yi + 1, zi), c11 = h(xi + 1, yi + 1, zi);
+    const c00z = h(xi, yi, zi + 1), c10z = h(xi + 1, yi, zi + 1), c01z = h(xi, yi + 1, zi + 1), c11z = h(xi + 1, yi + 1, zi + 1);
+    const x00 = c00 + (c10 - c00) * su, x10 = c01 + (c11 - c01) * su;
+    const x01 = c00z + (c10z - c00z) * su, x11 = c01z + (c11z - c01z) * su;
+    const y0 = x00 + (x10 - x00) * sv, y1 = x01 + (x11 - x01) * sv;
+    s += amp * (y0 + (y1 - y0) * sw); norm += amp;
+    fx = fx * 2.03 + 17.7; fy = fy * 1.97 - 9.1; fz = fz * 2.11 + 3.3; amp *= 0.5;
+  }
+  return s / norm;
+}
+// Tapered rock column (pinnacle) with a lumpy silhouette.
+function buildPinnacle(rng) {
+  const verts = [], idx = [];
+  const SEG = 11, SIDE = 7;
+  const base = 0;
+  for (let j = 0; j <= SEG; j++) {
+    const u = j / SEG;
+    // wide buttressed base, a bulge low down, then a broken, narrowing crown
+    const rr = (0.26 + 0.66 * Math.pow(1 - u, 0.72)) *
+               (1 + 0.14 * Math.sin(u * 8.5 + 1.7)) *
+               (1 + 0.30 * (fbm3s(u * 3.1, 4.4, 1.2) - 0.5) * 2);
+    const cx = (fbm3s(u * 2.2, 1.7, 8.1) - 0.5) * 0.34 * u;
+    const cz = (fbm3s(u * 2.4, 9.3, 2.2) - 0.5) * 0.34 * u;
+    for (let i = 0; i <= SIDE; i++) {
+      const a = (i / SIDE) * 6.2831853, ca = Math.cos(a), sa = Math.sin(a);
+      const bump = 1 + 0.34 * (fbm3s(ca * 2.1 + u * 3, sa * 2.1, u * 5) - 0.5) * 2;
+      const r = rr * bump;
+      verts.push(cx + ca * r, u * 1.0, cz + sa * r, ca * 0.85, 0.35, sa * 0.85);
+    }
+  }
+  const RS = SIDE + 1;
+  for (let j = 0; j < SEG; j++) for (let i = 0; i < SIDE; i++) {
+    const a = j * RS + i, b = a + 1, c = a + RS, d = c + 1;
+    idx.push(a, c, b, b, c, d);
+  }
+  let ci = verts.length / 6;
+  verts.push(0, 0, 0, 0, -1, 0);
+  for (let i = 0; i < SIDE; i++) idx.push(ci, base + i + 1, base + i);
+  const tp = verts.length / 6;
+  const ring = SEG * RS;
+  verts.push(verts[ring * 6], 1.0, verts[ring * 6 + 2], 0, 1, 0);
+  for (let i = 0; i < SIDE; i++) idx.push(tp, ring + i, ring + i + 1);
+  return makeGeo(new Float32Array(verts), new Uint32Array(idx));
+}
+// Natural stone arch: a slab-like tube swept over a half circle, legs buried below y=0.
+function buildArch(rng) {
+  const verts = [], idx = [];
+  const J = 16, S = 8, R = 1.0;
+  for (let j = 0; j <= J; j++) {
+    const u = j / J, a = -0.16 * Math.PI + u * (1.32 * Math.PI);
+    const ca = Math.cos(a), sa = Math.sin(a);
+    const wob = 1 + 0.16 * (fbm3s(u * 4.0, 2.2, 6.6) - 0.5) * 2;
+    for (let i = 0; i <= S; i++) {
+      const b = (i / S) * 6.2831853, cb = Math.cos(b), sb = Math.sin(b);
+      const rr = 0.15 * wob * (1 - 0.25 * Math.sin(u * Math.PI));
+      const rz = 0.46 * wob;
+      const px = ca * (R + rr * cb), py = sa * (R + rr * cb), pz = sb * rz;
+      const nx = ca * cb, ny = sa * cb, nz = sb * 0.5;
+      const l = Math.hypot(nx, ny, nz) || 1;
+      verts.push(px, py, pz, nx / l, ny / l, nz / l);
+    }
+  }
+  const RS = S + 1;
+  for (let j = 0; j < J; j++) for (let i = 0; i < S; i++) {
+    const a = j * RS + i, b = a + 1, c = a + RS, d = c + 1;
+    idx.push(a, c, b, b, c, d);
+  }
+  return makeGeo(new Float32Array(verts), new Uint32Array(idx));
+}
+// Barrel sponge: hollow-looking tapered cylinder with a wavy lip.
+function buildSponge(rng) {
+  const verts = [], idx = [];
+  sweep(verts, idx, u => [0, u * 1.0, 0], u => 0.42 + 0.28 * u + 0.07 * Math.sin(u * 9.0), 6, 10, true, false);
+  const lip = [];
+  const S = 10, J = 6, RS = S + 1;
+  for (let i = 0; i <= S; i++) {
+    const a = (i / S) * 6.2831853, r = 0.70 + 0.06 * Math.sin(a * 3.0 + 1.0);
+    lip.push(Math.cos(a) * r, 1.0 + 0.05 * Math.sin(a * 3.0), Math.sin(a) * r);
+  }
+  const lb = verts.length / 6;
+  for (let i = 0; i < lip.length; i += 3) verts.push(lip[i], lip[i + 1], lip[i + 2], 0, 1, 0);
+  const ring = J * RS;
+  for (let i = 0; i < S; i++) idx.push(lb + i, lb + i + 1, ring + i);
+  return makeGeo(new Float32Array(verts), new Uint32Array(idx));
+}
+// Branching coral: a few tapered fingers splaying out of a shared base.
+function buildCoral(rng) {
+  const verts = [], idx = [];
+  const F = 5;
+  for (let f = 0; f < F; f++) {
+    const a = (f / F) * 6.2831853 + rng() * 0.6;
+    const tilt = 0.30 + 0.45 * rng(), len = 0.55 + 0.45 * rng();
+    const dx = Math.cos(a) * Math.sin(tilt), dz = Math.sin(a) * Math.sin(tilt), dy = Math.cos(tilt);
+    sweep(verts, idx, u => {
+      const s = u * len, curl = 0.22 * u * u;
+      return [dx * s - Math.cos(a) * curl, dy * s + 0.04 + curl * 0.5, dz * s - Math.sin(a) * curl];
+    }, u => (0.13 + 0.05 * rng()) * (1 - 0.78 * u) + 0.012, 4, 5, true, true);
+  }
+  return makeGeo(new Float32Array(verts), new Uint32Array(idx));
+}
+// ---------------- set piece anchors ----------------
+const SET = {
+  ship:  { x: canyonCenter(26) + 32, z: 26, r: 38, y: 0 },
+  fluke: { x: canyonCenter(-30) - 26, z: -30, r: 30, y: 0 },
+  arches: [],        // laid out by layoutArches(); pose 5 aims through the picked one
+};
+SET.ship.y = bedHeight(SET.ship.x, SET.ship.z);
+SET.fluke.y = bedHeight(SET.fluke.x, SET.fluke.z);
+// Arches are laid out before the poses are aimed, so one opening can be chosen as a
+// viewpoint target and the rest kept clear of every other pose. The mesh spans along
+// its local x, so ry stays near 0: that puts the opening across the corridor and the
+// camera flies through the arch instead of alongside it.
+function layoutArches() {
+  const rng = mulberry32(0xA6C4E1);
+  SET.arches.length = 0;
+  for (let i = 0; i < 9; i++) {
+    const z = -186 + i * 44 + (rng() - 0.5) * 12;
+    const x = canyonCenter(z) + (rng() - 0.5) * 22;
+    SET.arches.push({ x: x, z: z, y: bedHeight(x, z), s: 13 + 10 * rng(), sy: 1.20 + 0.45 * rng(),
+                      rx: (rng() - 0.5) * 0.06, ry: (rng() - 0.5) * 0.22, rz: (rng() - 0.5) * 0.06,
+                      tint: rng() * 0.2, seed: rng(), isPose: false });
+  }
+}
+// Generic parametric surface with normals from central differences - the hull,
+// the manta wings and the stone fluke are all lofted grids.
+function gridMesh(rows, cols, posFn, skipFn) {
+  const verts = [], idx = [];
+  for (let j = 0; j <= rows; j++) for (let i = 0; i <= cols; i++) {
+    const p = posFn(i, j);
+    const pa = posFn(Math.min(cols, i + 1), j), pb = posFn(i, Math.min(rows, j + 1));
+    let nx = (pb[1] - p[1]) * (pa[2] - p[2]) - (pb[2] - p[2]) * (pa[1] - p[1]);
+    let ny = (pb[2] - p[2]) * (pa[0] - p[0]) - (pb[0] - p[0]) * (pa[2] - p[2]);
+    let nz = (pb[0] - p[0]) * (pa[1] - p[1]) - (pb[1] - p[1]) * (pa[0] - p[0]);
+    const l = Math.hypot(nx, ny, nz) || 1;
+    verts.push(p[0], p[1], p[2], nx / l, ny / l, nz / l);
+  }
+  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+    if (skipFn && skipFn(i, j)) continue;
+    const a = j * (cols + 1) + i, b = a + 1, c = a + cols + 1, d = c + 1;
+    idx.push(a, c, b, b, c, d);
+  }
+  return makeGeo(new Float32Array(verts), new Uint32Array(idx));
+}
+// Sunken hull: a U-section lofted from stern to bow, deck missing, one side breached.
+function buildShip(rng) {
+  const L = 36, HW = 5.2, D = 6.6, NS = 18, NP = 10;
+  const pos = (i, j) => {
+    const u = i / NS, t = j / NP;
+    const s = Math.sin(Math.PI * Math.pow(clamp(u, 0.02, 0.98), 0.8));
+    const hw = HW * (0.34 + 0.66 * s);
+    const dep = D * (0.48 + 0.52 * s);
+    const a = (t - 0.5) * Math.PI * 0.95;
+    const sheer = 2.9 * Math.pow(Math.abs(u - 0.5) * 2, 2.3);
+    const x = Math.sin(a) * hw;
+    const y = -dep * Math.pow(Math.max(0, Math.cos(a)), 1.25) + sheer * (t > 0.82 || t < 0.18 ? 1 : 0.15);
+    const wob = 0.20 * (fbm3s(u * 5.5, t * 3.1, 2.2) - 0.5) * 2;
+    return [x + wob * 0.5, y + wob, (u - 0.5) * L];
+  };
+  // gridMesh walks i across `cols` and j across `rows`, so the along-hull axis (NS) is
+  // the column count: passing them the other way round left the hull at 55 % of its
+  // length with the U-section curled past the gunwale.
+  const geo = gridMesh(NP, NS, pos, (i, j) => (j > 1 && j < 5 && i > 5 && i < 11 && (i + j) % 3 !== 0));
+  // two mast stubs, still standing
+  const v2 = Array.prototype.slice.call(geo.verts);
+  const idx2 = Array.prototype.slice.call(geo.idx);
+  for (let m = 0; m < 2; m++) {
+    const zc = m === 0 ? -6.0 : 7.5, hc = m === 0 ? 13.0 : 10.0;
+    sweep(v2, idx2, u => [0.5 + u * 0.9, -D * 0.35 + u * hc, zc + u * 0.6],
+          u => 0.46 * (1 - 0.55 * u) + 0.06, 5, 6, true, true);
+    sweep(v2, idx2, u => [-2.6 + u * 5.6, -D * 0.1 + hc * 0.66, zc - 0.4],
+          u => 0.22 * (1 - 0.4 * u) + 0.04, 3, 5, true, true);
+  }
+  // Frames: the ribs read as carpentry, which is what tells a hull from a boulder.
+  for (let k = 1; k <= 5; k++) {
+    const iR = Math.round(NS * k / 6);
+    sweep(v2, idx2, u => pos(iR, Math.round(u * NP)), () => 0.24, 9, 4, false, false);
+  }
+  // Both ends closed with a fan: an open tube seen from the side is the reason a hull
+  // can read as a curled sheet.
+  const cap = (i, zEnd) => {
+    const ci = v2.length / 6;
+    v2.push(0, -D * 0.40, zEnd, 0, 0.25, zEnd < 0 ? -1 : 1);
+    for (let j = 0; j < NP; j++) {
+      const a = j * (NS + 1) + i, b = (j + 1) * (NS + 1) + i;
+      idx2.push(ci, a, b);
+    }
+  };
+  cap(NS, (1 - 0.5) * L);
+  cap(0, (0 - 0.5) * L);
+  return makeGeo(new Float32Array(v2), new Uint32Array(idx2));
+}
+// Stone whale fluke: an elliptical blade lofted across the span, tipped up in the middle.
+function buildFluke(rng) {
+  const NS = 22, NR = 8;
+  const pos = (i, j) => {
+    const u = i / NS, x = (u - 0.5) * 2, ax = Math.abs(x);
+    const ch = 0.60 * Math.pow(Math.max(0, 1 - Math.pow(ax, 1.55)), 0.62) + 0.035;
+    const th = 0.075 * Math.pow(Math.max(0, 1 - Math.pow(ax, 1.2)), 0.8) + 0.010;
+    const yc = -0.30 * Math.pow(ax, 1.75) + 0.055;
+    const b = (j / NR) * 6.2831853;
+    const wob = 0.02 * (fbm3s(u * 6.0, j * 1.7, 3.3) - 0.5) * 2;
+    return [x, yc + Math.sin(b) * th + wob, Math.cos(b) * ch + wob * 0.5];
+  };
+  return gridMesh(NR, NS, pos);
+}
+// ---------------- prop placement ----------------
+// 16 floats per instance: pos+scale | rot+scaleY | tint seed kind extra | bob bobFreq spin pad
+function placeProps(rng) {
+  const data = new Float32Array(16 * 9000);
+  const groups = [];
+  let n = 0;
+  const put = (x, y, z, s, rx, ry, rz, sy, tint, seed, kind, extra, bob, bobf, spin) => {
+    const o = n * 16;
+    data[o] = x; data[o + 1] = y; data[o + 2] = z; data[o + 3] = s;
+    data[o + 4] = rx; data[o + 5] = ry; data[o + 6] = rz; data[o + 7] = sy;
+    data[o + 8] = tint; data[o + 9] = seed; data[o + 10] = kind; data[o + 11] = extra;
+    data[o + 12] = bob; data[o + 13] = bobf; data[o + 14] = spin; data[o + 15] = 0;
+    n++;
+  };
+  const start = () => groups.length;
+  const close = (name, mesh, first) => groups.push({ name, mesh, first, count: n - first });
+  const half = CFG.groundHalf - 20;
+  // a random flat-ish spot on the bed
+  const spot = (maxD, maxSlope) => {
+    for (let k = 0; k < 8; k++) {
+      const z = (rng() * 2 - 1) * half;
+      const d = (rng() * 2 - 1) * maxD;
+      const x = canyonCenter(z) + d;
+      if (Math.abs(x) > half) continue;
+      if (bedSlope(x, z) > maxSlope) continue;
+      SPOT.x = x; SPOT.z = z; SPOT.bed = bedHeight(x, z); SPOT.slope = bedSlope(x, z);
+      return true;
+    }
+    return false;
+  };
+  // A: boulders scattered on the valley floor and lower walls
+  let f = n;
+  for (let i = 0; i < 1200; i++) {
+    if (!spot(104, 0.95)) continue;
+    const s = 1.3 + 2.6 * rng() * rng() + (SPOT.slope > 0.5 ? 2.2 * rng() : 0);
+    if (!camClear(SPOT.x, SPOT.z, 8.5 + s)) continue;
+    put(SPOT.x, SPOT.bed - s * 0.30, SPOT.z, s,
+        (rng() - 0.5) * 1.2, rng() * 6.283, (rng() - 0.5) * 1.2, 0.62 + 0.55 * rng(),
+        rng(), rng(), 0, 0, 0, 0, 0);
+  }
+  close('boulder', 'ball', f);
+  // B: floating boulders hanging in mid water, in a few loose clusters
+  f = n;
+  for (let c = 0; c < 26; c++) {
+    const zc = (rng() * 2 - 1) * half, dc = (rng() * 2 - 1) * 84;
+    const xc = canyonCenter(zc) + dc;
+    const cb = bedHeight(xc, zc);
+    const baseY = cb + 16 + rng() * Math.max(10, CFG.surfaceY - cb - 38);
+    const per = 4 + Math.floor(rng() * 5);
+    for (let k = 0; k < per; k++) {
+      const s = 1.4 + 4.2 * rng() * rng();
+      const fx = xc + (rng() - 0.5) * 28, fy = baseY + (rng() - 0.5) * 17, fz = zc + (rng() - 0.5) * 28;
+      if (distToPath(fx, fy, fz) < s + 11) continue;   // never hang a rock on the lens
+      put(fx, fy, fz, s,
+          (rng() - 0.5) * 0.5, rng() * 6.283, (rng() - 0.5) * 0.5, 0.7 + 0.5 * rng(),
+          rng() * 0.4, rng(), 0, 0, 0.4 + 1.1 * rng(), 0.16 + 0.26 * rng(), (rng() - 0.5) * 0.05);
+    }
+  }
+  close('float', 'ball', f);
+  // C: rock pinnacles / columns rising from the floor
+  f = n;
+  for (let i = 0; i < 260; i++) {
+    if (!spot(100, 0.6)) continue;
+    const s = 5 + 13 * rng() * rng();
+    if (!camClear(SPOT.x, SPOT.z, 15 + s * 0.8)) continue;
+    put(SPOT.x, SPOT.bed - 1.2, SPOT.z, s, (rng() - 0.5) * 0.22, rng() * 6.283, (rng() - 0.5) * 0.22,
+        1.5 + 2.4 * rng(), rng() * 0.3, rng(), 0, 0, 0, 0, 0);
+  }
+  close('pinnacle', 'pin', f);
+  // D: overhang slabs clinging to the canyon walls
+  f = n;
+  for (let i = 0; i < 190; i++) {
+    const z = (rng() * 2 - 1) * half;
+    const C = canyonCenter(z);
+    const sgn = rng() < 0.5 ? -1 : 1;
+    const d = 58 + 52 * rng();
+    const x = C + sgn * d;
+    const bed = bedHeight(x, z);
+    const s = 7 + 13 * rng();
+    put(x, bed - s * 0.06 + rng() * 4, z, s, (rng() - 0.5) * 0.34, rng() * 6.283, (rng() - 0.5) * 0.30,
+        0.16 + 0.16 * rng(), rng() * 0.35, rng(), 0, 0, 0, 0, 0);
+  }
+  close('slab', 'ball', f);
+  // E: barrel sponges on the flatter ground
+  f = n;
+  for (let i = 0; i < 340; i++) {
+    if (!spot(88, 0.30)) continue;
+    const s = 1.0 + 2.4 * rng() * rng() + 0.6 * rng();
+    if (!camClear(SPOT.x, SPOT.z, 2.4 + s)) continue;
+    put(SPOT.x, SPOT.bed - 0.25, SPOT.z, s, (rng() - 0.5) * 0.16, rng() * 6.283, (rng() - 0.5) * 0.16,
+        0.8 + 0.7 * rng(), 0.25 + 0.7 * rng(), rng(), 3, 0, 0, 0, 0);
+  }
+  close('sponge', 'sponge', f);
+  // F: coral clusters
+  f = n;
+  for (let i = 0; i < 460; i++) {
+    if (!spot(96, 0.62)) continue;
+    const s = 1.0 + 2.6 * rng() * rng();
+    if (!camClear(SPOT.x, SPOT.z, 2.2 + s)) continue;
+    put(SPOT.x, SPOT.bed - 0.15, SPOT.z, s, (rng() - 0.5) * 0.2, rng() * 6.283, (rng() - 0.5) * 0.2,
+        0.85 + 0.5 * rng(), rng(), rng(), 4, 0, 0, 0, 0);
+  }
+  close('coral', 'coral', f);
+  // G: stone arches spanning the corridor
+  f = n;
+  for (const a of SET.arches) {
+    // keep every arch that is not a pose target out of the viewpoints' laps
+    if (!a.isPose && distToPoses(a.x, a.y + 14, a.z) < 36) continue;
+    put(a.x, a.y - 1.5, a.z, a.s, a.rx, a.ry, a.rz, a.sy, a.tint, a.seed, 0, 0, 0, 0, 0);
+  }
+  close('arch', 'arch', f);
+  // H: the two set pieces sit on their own flattened shelves
+  f = n;
+  {
+    const b = bedHeight(SET.ship.x, SET.ship.z);
+    SET.ship.y = b;
+    // hull axis is its local z, so yaw 0.95 presents a three-quarter broadside to the
+    // viewpoint; rz lists it 10 deg to one side like a hull settled in silt
+    put(SET.ship.x, b + 5.0, SET.ship.z, 1.45, 0.05, 0.95, -0.18, 1.0, 0.5, 0.31, 5, 0, 0, 0, 0);
+  }
+  close('ship', 'ship', f);
+  f = n;
+  {
+    const b = bedHeight(SET.fluke.x, SET.fluke.z);
+    SET.fluke.y = b;
+    // The blade is modelled flat (span = local x, chord = local z, faces = +-y).
+    // rx = 90 deg stands it up so the chord is vertical; ry = 90 deg then swings its
+    // face normal onto +x, straight at the viewpoint down the corridor.
+    put(SET.fluke.x, b + 8.5, SET.fluke.z, 15.0, 1.5708, 1.5708, 0.10, 1.0, 0.5, 0.77, 6, 0, 0, 0, 0);
+  }
+  close('fluke', 'fluke', f);
+  return { data: data.subarray(0, n * 16), n, groups };
+}
+const SPOT = { x: 0, z: 0, bed: 0, slope: 0 };
+// ---------------- animated creatures ----------------
+// Small fusiform body, forward +Z, one unit long; caudal and dorsal fins included.
+function buildFish(rng) {
+  const verts = [], idx = [];
+  const NS = 7, NR = 5;
+  for (let j = 0; j <= NS; j++) {
+    const u = j / NS, z = u - 0.5;
+    const w = Math.pow(Math.sin(Math.PI * Math.pow(u, 0.62)), 0.7);
+    const rx = 0.075 * w + 0.004, ry = 0.115 * w + 0.005, yc = -0.010 + 0.022 * w;
+    for (let i = 0; i <= NR; i++) {
+      const b = (i / NR) * 6.2831853, cb = Math.cos(b), sb = Math.sin(b);
+      let nx = cb * ry, ny = sb * rx;
+      const l = Math.hypot(nx, ny) || 1;
+      verts.push(cb * rx, yc + sb * ry, z, nx / l, ny / l, 0.12);
+    }
+  }
+  const RS = NR + 1;
+  for (let j = 0; j < NS; j++) for (let i = 0; i < NR; i++) {
+    const a = j * RS + i, b = a + 1, c = a + RS, d = c + 1;
+    idx.push(a, c, b, b, c, d);
+  }
+  const fin = (pts, n) => {   // flat 2-triangle fin, given four coplanar points
+    const base = verts.length / 6;
+    for (const p of pts) verts.push(p[0], p[1], p[2], n[0], n[1], n[2]);
+    idx.push(base, base + 1, base + 2, base + 1, base + 3, base + 2);
+  };
+  fin([[0, 0.010, -0.30], [0, 0.200, -0.62], [0, -0.010, -0.30], [0, -0.200, -0.62]], [1, 0, 0]);
+  fin([[0, 0.100, -0.10], [0, 0.230, 0.06], [0, 0.090, 0.02], [0, 0.200, 0.16]], [1, 0, 0]);
+  return makeGeo(new Float32Array(verts), new Uint32Array(idx));
+}
+// Wide diamond wing: lofted ellipse across the span, swept back, drooping tips.
+function buildManta(rng) {
+  const NS = 16, NR = 6;
+  const pos = (i, j) => {
+    const s = (i / NS) * 2 - 1, a = Math.abs(s);
+    const ch = 0.52 * Math.pow(Math.max(0, 1 - a), 0.72) + 0.055;
+    const th = 0.050 * Math.pow(Math.max(0, 1 - a), 0.5) + 0.008;
+    const b = (j / NR) * 6.2831853;
+    const crown = 0.050 * Math.max(0, 1 - a * 1.7);
+    return [s, -0.16 * a * a + Math.sin(b) * th + crown, Math.cos(b) * ch + 0.20 * a * a];
+  };
+  const geo = gridMesh(NR, NS, pos);
+  // long whip tail
+  const v2 = Array.prototype.slice.call(geo.verts), i2 = Array.prototype.slice.call(geo.idx);
+  sweep(v2, i2, u => [0, -0.02 - u * 0.05, 0.30 + u * 1.55], u => 0.030 * (1 - 0.85 * u) + 0.004, 4, 4, false, true);
+  return makeGeo(new Float32Array(v2), new Uint32Array(i2));
+}
+// Instance data for all four creature kinds; one storage buffer each.
+function placeLife(rng) {
+  const r = rng;
+  const half = CFG.groundHalf - 30;
+  const out = {};
+  const pack = (n, fill) => {
+    const a = new Float32Array(n * 12);
+    for (let i = 0; i < n; i++) {
+      const o = i * 12;
+      SPOT.v = 0;
+      fill(a, o, i, rng);
+    }
+    return a;
+  };
+  // marine snow: an even haze folded around the camera
+  const SNOW = Math.round(14000 * CFG.density);
+  out.snow = pack(SNOW, (a, o, i, r) => {
+    a[o] = r() * 130; a[o + 1] = r() * 80; a[o + 2] = r() * 130; a[o + 3] = r();
+    a[o + 4] = 0.02 + 0.07 * r() * r(); a[o + 5] = 0.10 + 0.34 * r();
+    a[o + 6] = 0.35 + 1.2 * r(); a[o + 7] = r();
+    a[o + 8] = 0; a[o + 9] = 130; a[o + 10] = 0; a[o + 11] = 0;
+  });
+  out.snowN = SNOW;
+  // bubbles: 150 vent sites throwing streams up through the water column
+  const BUB = Math.round(3000 * CFG.density);
+  const vents = [];
+  for (let v = 0; v < 150; v++) {
+    const z = (r() * 2 - 1) * half;
+    const x = canyonCenter(z) + (r() * 2 - 1) * 86;
+    vents.push([x, bedHeight(x, z), z]);
+  }
+  out.bub = pack(BUB, (a, o, i, r) => {
+    const v = vents[(r() * vents.length) | 0];
+    a[o] = v[0] + (r() - 0.5) * 9; a[o + 1] = r() * 50; a[o + 2] = v[2] + (r() - 0.5) * 9;
+    a[o + 3] = r();
+    a[o + 4] = 0.05 + 0.24 * r() * r(); a[o + 5] = 0.22 + 0.62 * r();
+    a[o + 6] = 0.5 + 1.8 * r(); a[o + 7] = r();
+    a[o + 8] = 1; a[o + 9] = 90; a[o + 10] = 0; a[o + 11] = 0;
+  });
+  out.bubN = BUB;
+  // fish schools circling just above the canyon floor
+  const SCH = 30, PER = Math.round(64 * CFG.density);
+  const fish = new Float32Array(SCH * PER * 12);
+  let fo = 0;
+  for (let s = 0; s < SCH; s++) {
+    let x = 0, y = 0, z = 0;
+    // schools are allowed to graze the corridor but not to sit inside it
+    for (let att = 0; att < 6; att++) {
+      z = (r() * 2 - 1) * half;
+      x = canyonCenter(z) + (r() * 2 - 1) * 64;
+      y = clamp(bedHeight(x, z) + 14 + r() * 34, -26, CFG.surfaceY - 24);
+      if (distToPath(x, y, z) > 13) break;
+    }
+    const seed = r(), spd = 0.05 + 0.10 * r(), sp = r() < 0.5 ? 0 : 1;
+    const ext = 5 + 9 * r(), wide = 1.5 + 4.5 * r();
+    for (let k = 0; k < PER; k++) {
+      fish[fo] = x; fish[fo + 1] = y; fish[fo + 2] = z;
+      fish[fo + 3] = 0.34 + 0.55 * r() * r() + 0.18 * r();
+      fish[fo + 4] = (r() - 0.5) * 2 * ext; fish[fo + 5] = (r() - 0.5) * 2 * wide;
+      fish[fo + 6] = (r() - 0.5) * 2 * ext; fish[fo + 7] = r();
+      fish[fo + 8] = seed; fish[fo + 9] = r(); fish[fo + 10] = sp; fish[fo + 11] = spd;
+      fo += 12;
+    }
+  }
+  out.fish = fish; out.fishN = SCH * PER;
+  // manta rays on slow circuits. A circuit that crosses the camera corridor is retried:
+  // a 9 m wingtip sweeping through the lens reads as a black slab, not as scale.
+  const MN = 8;
+  const orbitClear = (x, y, z, rr) => {
+    for (let k = 0; k < 16; k++) {
+      const b = (k / 16) * 6.2831;
+      const px = x + Math.cos(b) * rr, pz = z + Math.sin(b) * rr;
+      const py = Math.min(y + 9 * Math.sin(b * 0.47), CFG.surfaceY - 12);
+      if (distToPath(px, py, pz) < 26) return false;
+    }
+    return true;
+  };
+  out.manta = pack(MN, (a, o, i, r) => {
+    let x = 0, y = 0, z = 0, rr = 40, ok = false;
+    for (let att = 0; att < 10 && !ok; att++) {
+      z = (r() * 2 - 1) * (half - 40);
+      x = canyonCenter(z) + (r() * 2 - 1) * 40;
+      y = clamp(bedHeight(x, z) + 26 + r() * 26, -18, CFG.surfaceY - 30);
+      rr = 34 + 40 * r();
+      ok = orbitClear(x, y, z, rr);
+    }
+    a[o] = x; a[o + 1] = y; a[o + 2] = z; a[o + 3] = 2.2 + 2.6 * r();
+    a[o + 4] = r(); a[o + 5] = r(); a[o + 6] = (r() - 0.5) * 8; a[o + 7] = 0;
+    a[o + 8] = 0.030 + 0.036 * r(); a[o + 9] = rr; a[o + 10] = r(); a[o + 11] = 0;
+  });
+  out.mantaN = MN;
+  return out;
+}
+// ============================ renderer core ============================
+const canvas = document.getElementById('cv');
+const hudEl = document.getElementById('hud');
+const ovEl = document.getElementById('ov');
+const ovGpu = document.getElementById('ovgpu');
+const errEl = document.getElementById('err');
+
+const R = {
+  adapter: null, device: null, ctx: null,
+  canvasFormat: 'bgra8unorm', hdrFormat: 'rgba16float', depthFormat: 'depth32float',
+  samples: Math.max(1, CFG.msaa | 0),
+  w: 0, h: 0, time: 0, frame: 0,
+  ubo: null, uboData: new Float32Array(96), bgGlobal: null, sampler: null,
+  msaaColor: null, msaaDepth: null, hdr: null,
+  view: new Float32Array(16), proj: new Float32Array(16), viewProj: new Float32Array(16),
+  passes: [], ready: false, rebuildTargets: null,
+};
+const ERRORS = [];
+function pushErr(m) {
+  if (ERRORS.length < 40 && ERRORS.indexOf(m) < 0) {
+    ERRORS.push(m);
+    errEl.textContent = ERRORS.slice(0, 6).join('\n');
+    console.error(m);
+  }
+}
+window.addEventListener('error', e => pushErr('JS: ' + (e.message || e.type)));
+window.addEventListener('unhandledrejection', e => pushErr('JS promise: ' + (e.reason && e.reason.message || e.reason)));
+
+const PERF = {
+  mode: Q.has('profile') ? 'profile' : (Q.has('perf') ? 'fenced' : 'live'),
+  acc: Object.create(null), cnt: Object.create(null),
+  record(name, ms) { this.acc[name] = (this.acc[name] || 0) + ms; this.cnt[name] = (this.cnt[name] || 0) + 1; },
+};
+const stats = new Stats(4096);
+
+function makeTarget(w, h, format, usage, sampleCount) {
+  const tex = R.device.createTexture({ size: [w, h, 1], format, usage, sampleCount, dimension: '2d', mipLevelCount: 1 });
+  return { tex, view: tex.createView({ sampleCount }), w, h };
+}
+function disposeTarget(t) { if (t && t.tex) t.tex.destroy(); }
+const HDR_BIND = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
+function postBG(entries) {
+  return R.device.createBindGroup({ layout: LAYOUT.postBGL, entries });
+}
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, CFG.dprCap);
+  const w = Math.max(8, Math.round(canvas.clientWidth * dpr * CFG.renderScale));
+  const h = Math.max(8, Math.round(canvas.clientHeight * dpr * CFG.renderScale));
+  if (w === R.w && h === R.h && R.hdr) return;
+  R.w = w; R.h = h;
+  canvas.width = w; canvas.height = h;
+  disposeTarget(R.msaaColor); disposeTarget(R.msaaDepth); disposeTarget(R.hdr);
+  R.msaaColor = makeTarget(w, h, R.hdrFormat, GPUTextureUsage.RENDER_ATTACHMENT, R.samples);
+  R.msaaDepth = makeTarget(w, h, R.depthFormat,
+    GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING, R.samples);
+  R.hdr = makeTarget(w, h, R.hdrFormat, HDR_BIND, 1);
+  const hw = Math.max(4, w >> 1), hh = Math.max(4, h >> 1);
+  const qw = Math.max(4, w >> 2), qh = Math.max(4, h >> 2);
+  disposeTarget(R.rayA); disposeTarget(R.rayB); disposeTarget(R.blkA); disposeTarget(R.blkB);
+  R.rayA = makeTarget(hw, hh, R.hdrFormat, HDR_BIND, 1);
+  R.rayB = makeTarget(hw, hh, R.hdrFormat, HDR_BIND, 1);
+  R.blkA = makeTarget(qw, qh, R.hdrFormat, HDR_BIND, 1);
+  R.blkB = makeTarget(qw, qh, R.hdrFormat, HDR_BIND, 1);
+  if (R.rebuildTargets) R.rebuildTargets();
+}
+
+function mkPipe(code, vsEntry, fsEntry, opt) {
+  opt = opt || {};
+  const target = { format: opt.format || R.hdrFormat, writeMask: GPUColorWrite.ALL };
+  if (opt.blend === 'add') {
+    target.blend = { color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+                     alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' } };
+  } else if (opt.blend === 'alpha') {
+    target.blend = { color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                     alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' } };
+  }
+  const p = R.device.createRenderPipeline({
+    label: opt.name || fsEntry,
+    layout: opt.layout || 'auto',
+    vertex: { module: R.device.createShaderModule({ code, label: vsEntry }), entryPoint: vsEntry,
+              buffers: opt.vertexBuffers || [] },
+    fragment: { module: R.device.createShaderModule({ code, label: fsEntry }), entryPoint: fsEntry, targets: [target] },
+    primitive: { topology: opt.topology || 'triangle-list', frontFace: 'ccw', cullMode: opt.cull || 'back' },
+    depthStencil: opt.depth === false ? undefined : {
+      depthWriteEnabled: opt.depthWrite === false ? false : true,
+      depthCompare: opt.depthAlways ? 'always' : 'less', format: R.depthFormat },
+    multisample: { count: opt.samples || R.samples, alphaToCoverageEnabled: !!opt.a2c },
+  });
+  return p;
+}
+function uploadGeo(geo) {
+  const d = R.device;
+  const vb = d.createBuffer({ size: geo.verts.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+  d.queue.writeBuffer(vb, 0, geo.verts, 0, geo.verts.length);
+  const ib = d.createBuffer({ size: geo.idx.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+  d.queue.writeBuffer(ib, 0, geo.idx, 0, geo.idx.length);
+  return { vb, ib, count: geo.idx.length };
+}
+
+// ---------------- camera + controls ----------------
+const cam = {
+  x: CFG.startPos[0], y: CFG.startPos[1], z: CFG.startPos[2],
+  yaw: CFG.startYaw, pitch: CFG.startPitch, vx: 0, vy: 0, vz: 0,
+};
+const keys = Object.create(null);
+let locked = false, hudOn = true;
+function onKey(e, down) {
+  const c = e.code;
+  if (c === 'KeyH' && down) { hudOn = !hudOn; hudEl.style.display = hudOn ? '' : 'none'; }
+  if (c === 'KeyR' && down && !tour.on) resetCam();
+  if (c === 'ShiftLeft' || c === 'ShiftRight') keys.shift = down;
+  const m = { KeyW: 'f', KeyS: 'b', KeyA: 'l', KeyD: 'r', KeyE: 'u', KeyQ: 'd',
+              ArrowUp: 'f', ArrowDown: 'b', ArrowLeft: 'l', ArrowRight: 'r', Space: 'u', ControlLeft: 'd' };
+  if (m[c]) { keys[m[c]] = down; e.preventDefault(); }
+}
+window.addEventListener('keydown', e => onKey(e, true), { passive: false });
+window.addEventListener('keyup', e => onKey(e, false));
+canvas.addEventListener('pointerdown', () => { hideOverlay(); if (!locked && !tour.on) canvas.requestPointerLock(); });
+document.addEventListener('pointerlockchange', () => {
+  locked = document.pointerLockElement === canvas;
+  canvas.classList.toggle('locked', locked);
+});
+document.addEventListener('mousemove', e => {
+  if (!locked) return;
+  cam.yaw += e.movementX * CFG.mouseGain;
+  cam.pitch = clamp(cam.pitch - e.movementY * CFG.mouseGain, -1.5, 1.5);
+});
+function resetCam() {
+  cam.x = CFG.startPos[0]; cam.y = CFG.startPos[1]; cam.z = CFG.startPos[2];
+  cam.yaw = CFG.startYaw; cam.pitch = CFG.startPitch; cam.vx = cam.vy = cam.vz = 0;
+}
+let overlayHidden = false;
+const HIDE = new Set((Q.get('hide') || '').split(',').filter(Boolean));
+function hideOverlay() { if (!overlayHidden) { overlayHidden = true; ovEl.classList.add('hide'); } }
+
+// ---------------- scripted tour + fixed poses ----------------
+const TOUR_WP = new Float32Array([
+  // dx (off the canyon axis), y, z
+    10,  10,  118,
+    -6,  18,   74,
+   -22,   4,   34,
+   -26,  -8,   -6,
+    -8, -18,  -52,
+    16, -14,  -86,
+    28,   2,  -52,
+    24,  24,   -6,
+    12,  42,   36,
+     4,  28,   82,
+]);
+const TOUR_N = TOUR_WP.length / 3;
+for (let i = 0; i < TOUR_N; i++) TOUR_WP[i * 3] += canyonCenter(TOUR_WP[i * 3 + 2]);
+const tour = { on: false, t: 0, dur: 30, span: new Float32Array(3), pitch: 0, yaw: 0 };
+// dx is measured from the wandering canyon axis so every pose sits inside the corridor.
+// `look` aims the camera at a set piece; the yaw/pitch pair is derived in finalizePoses().
+const POSES = [
+  { name: 'canyon-start',    dx: -12, z: 92,  y: 2,   yaw: 0.03,  pitch: -0.02 },
+  { name: 'look-up-surface', dx: 2,   z: 52,  y: -8,  yaw: -0.20, pitch: 1.02 },
+  { name: 'ship-hull',       dx: -2,  z: 56,  y: -8,  look: 'ship',  lookY: 5,  lookDx: -34, lookDz: 30 },
+  { name: 'fluke-garden',    dx: 9,   z: -28, y: -11, look: 'fluke', lookY: 6,  lookDx: 36,  lookDz: 2 },
+  { name: 'kelp-corridor',   dx: -6,  z: -16, y: -10, yaw: 0.12,  pitch: 0.12 },
+  { name: 'deep-arch',       dx: -4,  z: -92, y: -14, look: 'arch', lookY: 10, standoff: 44 },
+];
+for (const p of POSES) p.x = canyonCenter(p.z) + p.dx;
+// Aim a pose at one of the set pieces. The camera is parked at a fixed standoff from
+// the target, then pitched so the target sits mid-frame, then lifted clear of the bed.
+const POSEPTS = new Float32Array(POSES.length * 3);
+function distToPoses(x, y, z) {        // closest approach of any critic viewpoint
+  let m = 1e9;
+  for (let i = 0; i < POSES.length; i++) {
+    const dx = POSEPTS[i * 3] - x, dy = POSEPTS[i * 3 + 1] - y, dz = POSEPTS[i * 3 + 2] - z;
+    const d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 < m) m = d2;
+  }
+  return Math.sqrt(m);
+}
+function finalizePoses() {
+  for (const p of POSES) {
+    if (!p.look) continue;
+    let t = SET[p.look];
+    if (p.look === 'arch') {
+      let best = null, bd = 1e9;
+      for (const a of SET.arches) { const dd = Math.abs(a.z - p.z); if (dd < bd) { bd = dd; best = a; } }
+      t = best;
+      if (t) {
+        t.isPose = true;                     // this opening is a target, not an obstacle
+        p.z = t.z + (p.standoff || 42);
+        p.x = canyonCenter(p.z) + (t.x - canyonCenter(t.z)) + p.dx;
+        p.dx = p.x - canyonCenter(p.z);
+      }
+    }
+    if (!t) continue;
+    if (p.lookDx !== undefined) {
+      p.x = t.x + p.lookDx; p.z = t.z + p.lookDz;
+      p.dx = p.x - canyonCenter(p.z);
+    }
+    const ty = t.y + (p.lookY || 0);
+    const dx = t.x - p.x, dz = t.z - p.z, hd = Math.max(1e-3, Math.hypot(dx, dz));
+    p.yaw = Math.atan2(dx, -dz);
+    p.y = Math.max(p.y, bedHeight(p.x, p.z) + 14);
+    p.pitch = Math.atan2(ty - p.y, hd);
+  }
+  for (let i = 0; i < POSES.length; i++) {
+    POSEPTS[i * 3] = POSES[i].x; POSEPTS[i * 3 + 1] = POSES[i].y; POSEPTS[i * 3 + 2] = POSES[i].z;
+  }
+}
+// ---- camera corridor -----------------------------------------------------
+// Every critic pose plus the whole fly-through loop, densely sampled. Big props are
+// rejected when they land inside this tube, so the lens is never buried in rock and
+// the set pieces always keep a clear line of sight.
+const CAMPT_MAX = 168;
+const CAMPTS = new Float32Array(CAMPT_MAX * 3);
+let CAMPT_N = 0;
+function pushCamPt(x, y, z) {
+  if (CAMPT_N >= CAMPT_MAX) return;
+  CAMPTS[CAMPT_N * 3] = x; CAMPTS[CAMPT_N * 3 + 1] = y; CAMPTS[CAMPT_N * 3 + 2] = z;
+  CAMPT_N++;
+}
+function buildCamPath() {
+  CAMPT_N = 0;
+  for (const p of POSES) {
+    pushCamPt(p.x, p.y, p.z);
+    pushCamPt(p.x + 9, p.y, p.z); pushCamPt(p.x - 9, p.y, p.z);   // turning the head
+  }
+  for (let k = 0; k < 120; k++) {
+    tourSample(k / 120);
+    pushCamPt(tour.span[0], tour.span[1], tour.span[2]);
+  }
+}
+function distToPath(x, y, z) {          // closest 3D approach of the camera path
+  let m = 1e9;
+  for (let i = 0; i < CAMPT_N; i++) {
+    const dx = CAMPTS[i * 3] - x, dy = CAMPTS[i * 3 + 1] - y, dz = CAMPTS[i * 3 + 2] - z;
+    const d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 < m) m = d2;
+  }
+  return Math.sqrt(m);
+}
+function camClear(x, z, r) {            // floor props: horizontal clearance only
+  const r2 = r * r;
+  for (let i = 0; i < CAMPT_N; i++) {
+    const dx = CAMPTS[i * 3] - x, dz = CAMPTS[i * 3 + 2] - z;
+    if (dx * dx + dz * dz < r2) return false;
+  }
+  return true;
+}
+function cr(a, b, c, d, t) {
+  const t2 = t * t, t3 = t2 * t;
+  return 0.5 * ((2 * b) + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (-a + 3 * b - 3 * c + d) * t3);
+}
+function tourSample(u) { // u in [0,1) around the closed loop -> tour.span / yaw / pitch
+  const f = u * TOUR_N, i = Math.floor(f) % TOUR_N, t = f - Math.floor(f);
+  const i0 = (i + TOUR_N - 1) % TOUR_N, i1 = i, i2 = (i + 1) % TOUR_N, i3 = (i + 2) % TOUR_N;
+  for (let k = 0; k < 3; k++) {
+    const a = TOUR_WP[i0 * 3 + k], b = TOUR_WP[i1 * 3 + k], c = TOUR_WP[i2 * 3 + k], d = TOUR_WP[i3 * 3 + k];
+    tour.span[k] = cr(a, b, c, d, t);
+    const n = cr(a, b, c, d, t + 0.01);
+    R.view[k] = n - tour.span[k];   // scratch for the tangent
+  }
+  const dx = R.view[0], dy = R.view[1], dz = R.view[2];
+  tour.span[1] = Math.max(tour.span[1], bedHeight(tour.span[0], tour.span[2]) + 12);
+  const len = Math.max(1e-5, Math.hypot(dx, dy, dz));
+  tour.yaw = Math.atan2(dx / len, -dz / len);
+  tour.pitch = Math.asin(clamp(dy / len, -1, 1));
+}
+// ---------------- per-frame uniform block ----------------
+const SUN = new Float32Array(4);
+{
+  const s = CFG.sunDir, l = Math.hypot(s[0], s[1], s[2]);
+  SUN[0] = s[0] / l; SUN[1] = s[1] / l; SUN[2] = s[2] / l; SUN[3] = CFG.sunIntensity;
+}
+const TANHALF = Math.tan(CFG.fovDeg * Math.PI / 360);
+const F = R.uboData;
+function writeUniforms() {
+  m4view(R.view, cam.x, cam.y, cam.z, cam.yaw, cam.pitch);
+  m4perspective(R.proj, CFG.fovDeg * Math.PI / 180, R.w / R.h, CFG.near, CFG.far);
+  m4mul(R.viewProj, R.proj, R.view);
+  F.set(R.viewProj, 0);
+  F.set(R.view, 16);
+  F[32] = cam.x; F[33] = cam.y; F[34] = cam.z; F[35] = R.time;
+  F[36] = cam.yaw; F[37] = cam.pitch; F[38] = CFG.surfaceY; F[39] = TANHALF;
+  F[40] = SUN[0]; F[41] = SUN[1]; F[42] = SUN[2]; F[43] = SUN[3];
+  F[44] = CFG.sunColor[0]; F[45] = CFG.sunColor[1]; F[46] = CFG.sunColor[2]; F[47] = 0;
+  F[48] = CFG.absorb[0]; F[49] = CFG.absorb[1]; F[50] = CFG.absorb[2]; F[51] = 0;
+  F[52] = CFG.shallow[0]; F[53] = CFG.shallow[1]; F[54] = CFG.shallow[2]; F[55] = 0;
+  F[56] = CFG.deep[0]; F[57] = CFG.deep[1]; F[58] = CFG.deep[2]; F[59] = 0;
+  F[60] = CFG.exposure; F[61] = CFG.causticStrength; F[62] = CFG.skyAmbient; F[63] = CFG.fogCull;
+  F[64] = CFG.near; F[65] = CFG.far; F[66] = CFG.godrayStrength; F[67] = CFG.godrayDecay;
+  F[68] = CFG.bloomThreshold; F[69] = CFG.bloomIntensity; F[70] = CFG.vignette; F[71] = CFG.contrast;
+  F[72] = R.w; F[73] = R.h; F[74] = 1 / R.w; F[75] = 1 / R.h;
+  F[76] = 1 / R.rayA.w; F[77] = 1 / R.rayA.h; F[78] = CFG.raySteps; F[79] = CFG.rayReach;
+  F[80] = CFG.diag; F[81] = 0; F[82] = 0; F[83] = 0;
+  R.device.queue.writeBuffer(R.ubo, 0, F, 0, F.length);
+}
+function updateCamera(dt) {
+  if (tour.on) {
+    const u = (tour.t / tour.dur) % 1;
+    tourSample(u);
+    cam.x = tour.span[0]; cam.z = tour.span[2];
+    cam.y = Math.max(tour.span[1], bedHeight(cam.x, cam.z) + 17.0);
+    cam.yaw = tour.yaw + 0.30 * Math.sin(tour.t * 0.21);
+    cam.pitch = clamp(tour.pitch + 0.18 * Math.sin(tour.t * 0.33 + 1.1) - 0.02, -1.4, 1.4);
+    cam.vx = cam.vy = cam.vz = 0;
+    return;
+  }
+  const boost = keys.shift ? CFG.boost : 1;
+  const sp = CFG.speed * boost;
+  const sy = Math.sin(cam.yaw), cy = Math.cos(cam.yaw);
+  const mf = (keys.f ? 1 : 0) - (keys.b ? 1 : 0);
+  const ms = (keys.r ? 1 : 0) - (keys.l ? 1 : 0);
+  const mu = (keys.u ? 1 : 0) - (keys.d ? 1 : 0);
+  const tx = (mf * sy + ms * cy) * sp, ty = mu * sp, tz = (-mf * cy + ms * sy) * sp;
+  const k = 1 - Math.exp(-CFG.damping * dt);
+  cam.vx += (tx - cam.vx) * k; cam.vy += (ty - cam.vy) * k; cam.vz += (tz - cam.vz) * k;
+  cam.x += cam.vx * dt; cam.y += cam.vy * dt; cam.z += cam.vz * dt;
+  const lim = CFG.groundHalf - 14;
+  cam.x = clamp(cam.x, -lim, lim); cam.z = clamp(cam.z, -lim, lim);
+  const floor = bedHeight(cam.x, cam.z) + 2.2;
+  if (cam.y < floor) { cam.y = floor; cam.vy = Math.max(0, cam.vy); }
+  const ceil = CFG.surfaceY - 3.0;
+  if (cam.y > ceil) { cam.y = ceil; cam.vy = Math.min(0, cam.vy); }
+}
+
+// ---------------- scene content (WP1: seabed + surface) ----------------
+const G = {};   // GPU geometry
+const P = {};   // pipelines
+const LAYOUT = {};  // shared layouts so every scene draw can reuse one bind group
+const FLORA = {};   // placement results (instance data), built once at boot
+const PROPS = { n: 0, groups: [] };
+let LIFE = { snowN: 0, bubN: 0, fishN: 0, mantaN: 0 };
+const BG = {};  // bind groups
+function initLayouts() {
+  LAYOUT.sceneBGL = R.device.createBindGroupLayout({ label: 'sceneBGL',
+    entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }],
+  });
+  LAYOUT.scene = R.device.createPipelineLayout({ label: 'scenePL', bindGroupLayouts: [LAYOUT.sceneBGL] });
+  LAYOUT.lifeBGL = R.device.createBindGroupLayout({ label: 'lifeBGL',
+    entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+              { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } }],
+  });
+  LAYOUT.life = R.device.createPipelineLayout({ label: 'lifePL', bindGroupLayouts: [LAYOUT.lifeBGL] });
+  const FS = GPUShaderStage.FRAGMENT;
+  const tex = (sampleType, multisampled) => ({ binding: 0, visibility: FS, texture: { sampleType, viewDimension: '2d', multisampled } });
+  LAYOUT.postBGL = R.device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: FS, buffer: { type: 'uniform' } },
+    { binding: 1, visibility: FS, sampler: { type: 'filtering' } },
+    Object.assign(tex('float', false), { binding: 2 }),
+    Object.assign(tex('depth', true), { binding: 3 }),
+    Object.assign(tex('float', false), { binding: 4 }),
+    Object.assign(tex('float', false), { binding: 5 }),
+  ] });
+  LAYOUT.post = R.device.createPipelineLayout({ bindGroupLayouts: [LAYOUT.postBGL] });
+}
+function buildWorld() {
+  layoutArches();       // set-piece openings first, so a pose can be aimed through one
+  finalizePoses();      // then aim the critic poses at the set pieces
+  buildCamPath();       // ...and finally the corridor that props have to stay out of
+  G.ground = uploadGeo(buildGround(CFG.gridN, CFG.groundHalf));
+  G.surf = uploadGeo(buildDisc(40, 128, 14, 520));
+  // kelp: one stalk mesh + one preallocated instance buffer
+  G.kelp = uploadGeo(buildKelpMesh(mulberry32(0x9E3779)));
+  const fl = placeFlora(mulberry32(0x51A7));
+  FLORA.kelp = fl;
+  G.kelpInst = R.device.createBuffer({ size: fl.data.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+  R.device.queue.writeBuffer(G.kelpInst, 0, fl.data, 0, fl.data.length);
+  R.kelpN = clamp(Math.round(fl.n * CFG.density), 1, fl.n);
+  // props: hard-matter meshes sharing one instance buffer
+  const mrng = mulberry32(0x2B1B);
+  G.ball = uploadGeo(buildRockBall(mrng, 12, 18, 0.34, 2.35));
+  G.pin = uploadGeo(buildPinnacle(mrng));
+  G.arch = uploadGeo(buildArch(mrng));
+  G.sponge = uploadGeo(buildSponge(mrng));
+  G.coral = uploadGeo(buildCoral(mrng));
+  G.ship = uploadGeo(buildShip(mrng));
+  G.fluke = uploadGeo(buildFluke(mrng));
+  const pr = placeProps(mulberry32(0xBEEF11));
+  PROPS.n = pr.n; PROPS.groups = pr.groups;
+  G.propInst = R.device.createBuffer({ size: pr.data.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+  R.device.queue.writeBuffer(G.propInst, 0, pr.data, 0, pr.data.length);
+  P.bed = mkPipe(WGSL_BED, 'bedVS', 'bedFS', { cull: 'none', layout: LAYOUT.scene, vertexBuffers: [
+    { arrayStride: 24, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' },
+                                    { shaderLocation: 1, offset: 12, format: 'float32x3' }] }], });
+  P.surf = mkPipe(WGSL_SURF, 'surfVS', 'surfFS', { cull: 'none', layout: LAYOUT.scene, vertexBuffers: [
+    { arrayStride: 12, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }] }], });
+  P.prop = mkPipe(WGSL_PROP, 'propVS', 'propFS', { cull: 'none', layout: LAYOUT.scene, vertexBuffers: [
+    { arrayStride: 24, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' },
+                                    { shaderLocation: 1, offset: 12, format: 'float32x3' }] },
+    { arrayStride: 64, stepMode: 'instance', attributes: [{ shaderLocation: 2, offset: 0, format: 'float32x4' },
+                                                          { shaderLocation: 3, offset: 16, format: 'float32x4' },
+                                                          { shaderLocation: 4, offset: 32, format: 'float32x4' },
+                                                          { shaderLocation: 5, offset: 48, format: 'float32x4' }] }], });
+  // creatures: motion lives in the vertex shader, data in one storage buffer per kind
+  const lf = placeLife(mulberry32(0xFEED5));
+  LIFE = lf;
+  G.fish = uploadGeo(buildFish(mrng));
+  G.manta = uploadGeo(buildManta(mrng));
+  const mkStore = arr => {
+    const b = R.device.createBuffer({ size: arr.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    R.device.queue.writeBuffer(b, 0, arr, 0, arr.length);
+    return b;
+  };
+  const store = { snow: mkStore(lf.snow), bub: mkStore(lf.bub), fish: mkStore(lf.fish), manta: mkStore(lf.manta) };
+  const mkLifeBG = (buf, nm) => R.device.createBindGroup({
+    label: 'lifeBG:' + nm, layout: LAYOUT.lifeBGL,
+    entries: [{ binding: 0, resource: { buffer: R.ubo } }, { binding: 1, resource: { buffer: buf } }],
+  });
+  BG.snow = mkLifeBG(store.snow, 'snow'); BG.bub = mkLifeBG(store.bub, 'bub');
+  BG.fish = mkLifeBG(store.fish, 'fish'); BG.manta = mkLifeBG(store.manta, 'manta');
+  const MO = { cull: 'none', layout: LAYOUT.life, blend: 'add', depthWrite: false };
+  P.snow = mkPipe(WGSL_LIFE, 'moteVS', 'moteFS', Object.assign({ name: 'snow' }, MO));
+  P.bub = mkPipe(WGSL_LIFE, 'moteVS', 'moteFS', Object.assign({ name: 'bub' }, MO));
+  const FO = { cull: 'none', layout: LAYOUT.life, vertexBuffers:
+    [{ arrayStride: 24, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' },
+                                     { shaderLocation: 1, offset: 12, format: 'float32x3' }] }] };
+  P.fish = mkPipe(WGSL_LIFE, 'fishVS', 'fishFS', Object.assign({ name: 'fish' }, FO));
+  P.manta = mkPipe(WGSL_LIFE, 'mantaVS', 'mantaFS', Object.assign({ name: 'manta' }, FO));
+  P.bg = mkPipe(WGSL_BED, 'fullVS', 'bgFS', { name: 'bg', layout: LAYOUT.scene, depthAlways: true, depthWrite: false });
+  P.kelp = mkPipe(WGSL_KELP, 'kelpVS', 'kelpFS', { cull: 'none', layout: LAYOUT.scene, vertexBuffers: [
+    { arrayStride: 32, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' },
+                                    { shaderLocation: 1, offset: 12, format: 'float32x3' },
+                                    { shaderLocation: 2, offset: 24, format: 'float32x2' }] },
+    { arrayStride: 48, stepMode: 'instance', attributes: [{ shaderLocation: 3, offset: 0, format: 'float32x4' },
+                                                          { shaderLocation: 4, offset: 16, format: 'float32x4' },
+                                                          { shaderLocation: 5, offset: 32, format: 'float32x4' }] }], });
+  const PO = { depth: false, samples: 1, layout: LAYOUT.post };
+  P.rays = mkPipe(WGSL_POST, 'fullVS', 'raysFS', Object.assign({ name: 'rays' }, PO));
+  P.blurH = mkPipe(WGSL_POST, 'fullVS', 'blurHFS', Object.assign({ name: 'blurH' }, PO));
+  P.blurV = mkPipe(WGSL_POST, 'fullVS', 'blurVFS', Object.assign({ name: 'blurV' }, PO));
+  P.bright = mkPipe(WGSL_POST, 'fullVS', 'brightFS', Object.assign({ name: 'bright' }, PO));
+  P.post = mkPipe(WGSL_POST, 'fullVS', 'compositeFS',
+    Object.assign({ name: 'composite', format: R.canvasFormat }, PO));
+}
+function opaquePass(enc, tsb) {
+  const rp = enc.beginRenderPass({
+    colorAttachments: [{ view: R.msaaColor.view, resolveTarget: R.hdr.view, loadOp: 'clear', storeOp: 'store',
+                         clearValue: { r: 0.006, g: 0.045, b: 0.075, a: 1 } }],
+    depthStencilAttachment: { view: R.msaaDepth.view, depthLoadOp: 'clear', depthClearValue: 1, depthStoreOp: 'store' },
+  });
+  TS.mark(rp, tsb, 0);
+  rp.setBindGroup(0, BG.global);
+  if (!HIDE.has('bg')) { rp.setPipeline(P.bg); rp.draw(3); }
+  if (!HIDE.has('bed')) {
+    rp.setPipeline(P.bed);
+    rp.setVertexBuffer(0, G.ground.vb); rp.setIndexBuffer(G.ground.ib, 'uint32');
+    rp.drawIndexed(G.ground.count);
+  }
+  if (!HIDE.has('props')) {
+    rp.setPipeline(P.prop);
+    rp.setVertexBuffer(1, G.propInst);
+    const gs = PROPS.groups;
+    for (let i = 0; i < gs.length; i++) {
+      if (HIDE.has(gs[i].name)) continue;
+      const m = G[gs[i].mesh];
+      rp.setVertexBuffer(0, m.vb);
+      rp.setIndexBuffer(m.ib, 'uint32');
+      rp.drawIndexed(m.count, gs[i].count, 0, 0, gs[i].first);
+    }
+  }
+  if (!HIDE.has('kelp')) {
+    rp.setPipeline(P.kelp);
+    rp.setVertexBuffer(0, G.kelp.vb); rp.setVertexBuffer(1, G.kelpInst);
+    rp.setIndexBuffer(G.kelp.ib, 'uint32');
+    rp.drawIndexed(G.kelp.count, R.kelpN);
+  }
+  if (!HIDE.has('fish')) {
+    rp.setPipeline(P.fish); rp.setBindGroup(0, BG.fish);
+    rp.setVertexBuffer(0, G.fish.vb); rp.setIndexBuffer(G.fish.ib, 'uint32');
+    rp.drawIndexed(G.fish.count, LIFE.fishN);
+  }
+  if (!HIDE.has('manta')) {
+    rp.setPipeline(P.manta); rp.setBindGroup(0, BG.manta);
+    rp.setVertexBuffer(0, G.manta.vb); rp.setIndexBuffer(G.manta.ib, 'uint32');
+    rp.drawIndexed(G.manta.count, LIFE.mantaN);
+  }
+  if (!HIDE.has('surf')) {
+    rp.setPipeline(P.surf); rp.setBindGroup(0, BG.global);
+    rp.setVertexBuffer(0, G.surf.vb); rp.setIndexBuffer(G.surf.ib, 'uint32');
+    rp.drawIndexed(G.surf.count);
+  }
+  // additive drift: drawn last so it glows over the lit scene, depth-tested so
+  // it hides behind rock and kelp correctly
+  if (!HIDE.has('snow')) { rp.setPipeline(P.snow); rp.setBindGroup(0, BG.snow); rp.draw(6, LIFE.snowN); }
+  if (!HIDE.has('bub')) { rp.setPipeline(P.bub); rp.setBindGroup(0, BG.bub); rp.draw(6, LIFE.bubN); }
+  TS.mark(rp, tsb, 1);
+  rp.end();
+}
+const CLEAR = { r: 0, g: 0, b: 0, a: 1 };
+function fsRun(enc, pipe, bg, view, tsb) {
+  const rp = enc.beginRenderPass({ colorAttachments: [{
+    view, loadOp: 'clear', storeOp: 'store', clearValue: CLEAR }] });
+  TS.mark(rp, tsb, 0);
+  if (bg !== BG.none) {
+    rp.setPipeline(pipe);
+    rp.setBindGroup(0, bg);
+    rp.draw(3);
+  }
+  TS.mark(rp, tsb, 1);
+  rp.end();
+}
+function compositePass(enc, tsb) {
+  const rp = enc.beginRenderPass({ colorAttachments: [{
+    view: R.ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store',
+    clearValue: CLEAR }] });
+  TS.mark(rp, tsb, 0);
+  rp.setPipeline(P.post);
+  rp.setBindGroup(0, BG.post);
+  rp.draw(3);
+  TS.mark(rp, tsb, 1);
+  rp.end();
+}
+function buildPasses() {
+  R.passes.length = 0;
+  R.passes.push({ name: 'scene', run: opaquePass });
+  BG.none = BG.none || { hidden: true };
+  // The passes stay in the list even when hidden (bound to BG.none) so the timestamp
+  // pairing per pass is preserved and hiding only removes the draw.
+  const fs = (name, key, pipe, bgName, tgt) => R.passes.push({ name,
+    run: (e, tsb) => fsRun(e, pipe, HIDE.has(key) ? BG.none : BG[bgName], R[tgt].view, tsb) });
+  fs('rays', 'rays', P.rays, 'rays', 'rayA');
+  fs('rayH', 'rays', P.blurH, 'rayH', 'rayB');
+  fs('rayV', 'rays', P.blurV, 'rayV', 'rayA');
+  fs('bright', 'bloom', P.bright, 'bright', 'blkA');
+  fs('bloomH', 'bloom', P.blurH, 'bloomH', 'blkB');
+  fs('bloomV', 'bloom', P.blurV, 'bloomV', 'blkA');
+  R.passes.push({ name: 'composite', run: compositePass });
+}
+function rebuildTargets() {
+  // One explicit layout for every post pass: the unused slots are simply bound to
+  // textures that pass does not read (never the one it writes).
+  const e = (b, r) => ({ binding: b, resource: r });
+  const D = e(3, R.msaaDepth.view);
+  BG.rays = postBG([e(0, { buffer: R.ubo }), e(1, R.sampler), e(2, R.hdr.view), D,
+                    e(4, R.blkA.view), e(5, R.blkB.view)]);
+  BG.rayH = postBG([e(0, { buffer: R.ubo }), e(1, R.sampler), e(2, R.hdr.view), D,
+                    e(4, R.rayA.view), e(5, R.blkA.view)]);
+  BG.rayV = postBG([e(0, { buffer: R.ubo }), e(1, R.sampler), e(2, R.hdr.view), D,
+                    e(4, R.rayB.view), e(5, R.blkA.view)]);
+  BG.bright = postBG([e(0, { buffer: R.ubo }), e(1, R.sampler), e(2, R.hdr.view), D,
+                      e(4, R.rayA.view), e(5, R.blkB.view)]);
+  BG.bloomH = postBG([e(0, { buffer: R.ubo }), e(1, R.sampler), e(2, R.hdr.view), D,
+                      e(4, R.blkA.view), e(5, R.rayA.view)]);
+  BG.bloomV = postBG([e(0, { buffer: R.ubo }), e(1, R.sampler), e(2, R.hdr.view), D,
+                      e(4, R.blkB.view), e(5, R.rayA.view)]);
+  BG.post = postBG([e(0, { buffer: R.ubo }), e(1, R.sampler), e(2, R.hdr.view), D,
+                    e(4, R.rayA.view), e(5, R.blkA.view)]);
+}
+// ---------------- GPU timestamp queries ----------------
+// Marks are written around every pass, so one query set yields both the total
+// device time per frame and a per-pass breakdown.
+const TS = { ok: false, n: 0, slots: [], i: 0, qs: null, every: qp('ts', 24), why: '',
+  mark(rp, tsb, k) { if (tsb >= 0 && rp.writeTimestamp) rp.writeTimestamp(TS.qs, tsb + k); } };
+function tsInit() {
+  const F = R.device.features;
+  if (!F.has('timestamp-query')) { TS.why = 'no timestamp-query feature'; return; }
+  // Chrome moved writeTimestamp from the command encoder onto the render-pass encoder;
+  // the pass-level flavour needs the experimental inside-passes feature on the device.
+  if (!F.has('chromium-experimental-timestamp-query-inside-passes')) {
+    TS.why = 'pass-level timestamps need chromium-experimental-timestamp-query-inside-passes';
+    return;
+  }
+  TS.n = 2 * R.passes.length;
+  for (let s = 0; s < 4; s++) TS.slots.push({
+    qs: R.device.createQuerySet({ type: 'timestamp', count: TS.n }),
+    rb: R.device.createBuffer({ size: TS.n * 8,
+      usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC }),
+    buf: R.device.createBuffer({ size: TS.n * 8,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+  });
+  TS.ok = true;
+}
+function tsRead(slot) {
+  slot.buf.mapAsync(GPUMapMode.READ).then(() => {
+    const raw = new BigUint64Array(slot.buf.getMappedRange().slice(0));
+    const tot = (Number(raw[TS.n - 1]) - Number(raw[0])) / 1e6;
+    for (let i = 0; i < R.passes.length; i++) {
+      PERF.record(R.passes[i].name, (Number(raw[2 * i + 1]) - Number(raw[2 * i])) / 1e6);
+    }
+    slot.buf.unmap();
+    if (tot > 0 && tot < 5000) stats.pushGpu(tot);
+  }).catch(e => pushErr('ts: ' + String(e && e.message || e).split('\n')[0]));
+}
+function renderAll(tsOn) {
+  const enc = R.device.createCommandEncoder();
+  let slot = null;
+  if (tsOn && TS.ok) { slot = TS.slots[TS.i]; TS.i = (TS.i + 1) & 3; TS.qs = slot.qs; }
+  for (let i = 0; i < R.passes.length; i++) R.passes[i].run(enc, slot ? 2 * i : -1);
+  if (slot) {
+    enc.resolveQuerySet(slot.qs, 0, TS.n, slot.rb, 0);
+    enc.copyBufferToBuffer(slot.rb, 0, slot.buf, 0, TS.n * 8);
+  }
+  R.device.queue.submit([enc.finish()]);
+  return slot;
+}
+// One submit per pass, but each pass is replayed REP times inside that submit so the
+// fixed fence/sync cost is divided by REP instead of landing on every pass number.
+const REP = Math.max(1, qp('rep', 6));
+async function renderProfile() {
+  let total = 0;
+  for (let i = 0; i < R.passes.length; i++) {
+    const p = R.passes[i];
+    const enc = R.device.createCommandEncoder();
+    for (let k = 0; k < REP; k++) p.run(enc);
+    const t0 = performance.now();
+    R.device.queue.submit([enc.finish()]);
+    await R.device.queue.onSubmittedWorkDone();
+    const ms = (performance.now() - t0) / REP;
+    PERF.record(p.name, ms); total += ms;
+  }
+  return total;
+}
+
+// ---------------- frame loop ----------------
+let RUNNING = false, rafId = 0, lastNow = 0, hudLast = 0, gpuLast = 0;
+function stepFrame(cpuMs) {
+  const dt = Math.min(0.05, cpuMs * 0.001);
+  R.time += dt; R.frame++;
+  if (tour.on) tour.t += dt;
+  updateCamera(dt);
+  writeUniforms();
+}
+function hudTick(now) {
+  if (!hudOn || now - hudLast < 200) return;
+  hudLast = now;
+  const r = stats.report();
+  hudEl.textContent =
+    (r.frames ? (r.fps.avg.toFixed(0) + ' fps  ' + r.ms.avg.toFixed(2) + ' ms  p99 ' + r.ms.p99.toFixed(1) +
+                 '  gpu ' + ((r.tsMs && r.tsMs.avg) || r.gpuMs.avg || 0).toFixed(2)) : '-') +
+    '\n' + cam.x.toFixed(1) + ', ' + cam.y.toFixed(1) + ', ' + cam.z.toFixed(1) +
+    (tour.on ? '  TOUR ' + ((tour.t / tour.dur) % 1 * 100).toFixed(0) + '%' : (locked ? '  locked' : '')) +
+    '\nmsaa x' + R.samples + '  ' + R.w + 'x' + R.h + '  t ' + R.time.toFixed(0) + 's';
+}
+function liveTick(now) {
+  rafId = requestAnimationFrame(liveTick);
+  const cpu = now - lastNow; lastNow = now;
+  if (cpu <= 0 || cpu > 500) { stats.push(16.7, 0); return; }
+  stepFrame(cpu);
+  const slot = renderAll(TS.ok && (R.frame % TS.every) === 0);
+  if (slot) tsRead(slot);
+  if (LUMA_REQ) { const q = LUMA_REQ; LUMA_REQ = null; q(sampleLuma()); }
+  stats.push(cpu, 0);
+  hudTick(now);
+}
+// Brightness probe for the verification tooling: sampled inside the frame, because a
+// WebGPU canvas reads back as blank between frames. The 2D scratch canvas is created
+// on first use and reused, so probing adds no per-frame garbage either.
+let LUMA_REQ = null, lumaCv = null, lumaCtx = null;
+function sampleLuma() {
+  if (!lumaCv) {
+    lumaCv = document.createElement('canvas');
+    lumaCv.width = 160; lumaCv.height = 90;
+    lumaCtx = lumaCv.getContext('2d', { willReadFrequently: true });
+  }
+  lumaCtx.drawImage(canvas, 0, 0, 160, 90);
+  const d = lumaCtx.getImageData(0, 0, 160, 90).data;
+  let s = 0, sr = 0, sg = 0, sb = 0, cl = 0, c16 = 0, c84 = 0, mx = 0;
+  const n = d.length / 4;
+  for (let i = 0; i < d.length; i += 4) {
+    const l = (d[i] * 0.2126 + d[i + 1] * 0.7152 + d[i + 2] * 0.0722) / 255;
+    s += l; sr += d[i] / 255; sg += d[i + 1] / 255; sb += d[i + 2] / 255;
+    if (l > mx) mx = l;
+    if (l < 0.055) c16++; else if (l < 0.28) c84++; else cl++;
+  }
+  return [+(s / n).toFixed(3), +mx.toFixed(3), +(sr / n).toFixed(3), +(sg / n).toFixed(3),
+          +(sb / n).toFixed(3), +(c16 / n).toFixed(3), +(c84 / n).toFixed(3), +(cl / n).toFixed(3)];
+}
+sampleLuma.h = new Float32Array(64);
+// Contact sheet for the visual review: each requested pose is blitted from the live
+// canvas into a grid on an offscreen 2D canvas, then handed back as one data URL.
+let SHEET = null, SHEET_REQ = null;
+function sheetBlit() {
+  const c = SHEET.ctx, i = SHEET.i % SHEET.cols, r = (SHEET.i / SHEET.cols) | 0;
+  c.drawImage(canvas, i * SHEET.cw, r * SHEET.ch, SHEET.cw, SHEET.ch);
+  c.strokeStyle = 'rgba(255,255,255,0.35)';
+  c.strokeRect(i * SHEET.cw + 0.5, r * SHEET.ch + 0.5, SHEET.cw - 1, SHEET.ch - 1);
+  c.fillStyle = '#fff'; c.font = '20px monospace';
+  c.fillText(SHEET.label + ' ' + (SHEET.names[SHEET.i] || ''), i * SHEET.cw + 8, r * SHEET.ch + 24);
+  SHEET.i++;
+}
+const nextRAF = () => new Promise(res => requestAnimationFrame(res));
+async function syncLoop() {
+  while (RUNNING) {
+    const now = await nextRAF();
+    const cpu = now - lastNow; lastNow = now;
+    if (cpu <= 0 || cpu > 500) continue;
+    stepFrame(cpu);
+    if (PERF.mode === 'profile') { gpuLast = await renderProfile(); stats.push(cpu, gpuLast); }
+    else {
+      const t0 = performance.now();
+      const slot = renderAll(TS.ok);
+      if (slot) tsRead(slot);
+      await R.device.queue.onSubmittedWorkDone();
+      gpuLast = performance.now() - t0;
+      stats.push(cpu, gpuLast);
+    }
+    hudTick(now);
+  }
+}
+
+// ---------------- external control / verification API ----------------
+const API = {
+  get ready() { return R.ready; },
+  poses: POSES.map(p => p.name),
+  errors: ERRORS,
+  info: CFG,
+  setPose(i) {
+    const p = POSES[((i % POSES.length) + POSES.length) % POSES.length];
+    tour.on = false;
+    cam.x = p.x; cam.z = p.z;
+    cam.y = Math.max(p.y, bedHeight(p.x, p.z) + 14.0);
+    cam.yaw = p.yaw; cam.pitch = p.pitch;
+    cam.vx = cam.vy = cam.vz = 0;
+    hideOverlay();
+    return p.name;
+  },
+  startTour(sec) {
+    tour.on = true; tour.t = 0; tour.dur = Math.max(4, sec || 30);
+    stats.reset(); PERF.acc = Object.create(null); PERF.cnt = Object.create(null);
+    hideOverlay();
+    return tour.dur;
+  },
+  stopTour() { tour.on = false; return true; },
+  get tourProgress() { return tour.on ? (tour.t / tour.dur) % 1 : -1; },
+  resetStats() { stats.reset(); PERF.acc = Object.create(null); PERF.cnt = Object.create(null); },
+  getStats() {
+    const r = stats.report();
+    r.mode = PERF.mode; r.frame = R.frame; r.time = +R.time.toFixed(1);
+    r.size = [R.w, R.h]; r.msaa = R.samples;
+    r.errors = ERRORS.slice(0, 8);
+    const pm = Object.create(null);
+    for (const k in PERF.acc) pm[k] = +(PERF.acc[k] / Math.max(1, PERF.cnt[k])).toFixed(3);
+    r.passMs = pm;
+    r.cam = [+cam.x.toFixed(1), +cam.y.toFixed(1), +cam.z.toFixed(1),
+             +cam.yaw.toFixed(3), +cam.pitch.toFixed(3)];
+    return r;
+  },
+  set(k, v) { if (k in CFG) { CFG[k] = v; return CFG[k]; } return null; },
+  hud(on) { hudOn = !!on; hudEl.style.display = hudOn ? '' : 'none'; return hudOn; },
+  hideOverlay: hideOverlay,
+  hide(s) {   // debug: limit which layers draw, e.g. __scene.hide('kelp,props')
+    HIDE.clear();
+    for (const k of String(s || '').split(',').filter(Boolean)) HIDE.add(k);
+    return Array.from(HIDE).join(' ');
+  },
+  resetCam: resetCam,
+  frameLog() {   // raw rAF deltas of the measured window, for the perf log file
+    const n = stats.n, out = new Array(n);
+    for (let i = 0; i < n; i++) out[i] = +stats.cpu[i].toFixed(2);
+    return out;
+  },
+  gpuLog() {
+    const n = stats.n, out = new Array(n);
+    for (let i = 0; i < n; i++) out[i] = +stats.gpu[i].toFixed(2);
+    return out;
+  },
+  tsInfo() { return { ok: TS.ok, why: TS.why, passLevel: !!TS.passLevel }; },
+  luma() { return new Promise(res => { LUMA_REQ = res; }); },   // sampled inside the next frame
+  cam: cam, bed: bedHeight, surfaceY: CFG.surfaceY,
+  POSES: POSES, stats: stats,
+};
+window.__scene = API;
+
+// ---------------- boot ----------------
+async function boot() {
+  if (!navigator.gpu) { ovGpu.textContent = 'WebGPU is not available in this browser'; pushErr('no navigator.gpu'); return; }
+  R.adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!R.adapter) { ovGpu.textContent = 'no WebGPU adapter'; pushErr('no adapter'); return; }
+  const req = [];
+  if (R.adapter.features.has('timestamp-query')) req.push('timestamp-query');
+  // Builds that only allow timestamps inside a render pass advertise this extra feature.
+  for (const f of ['chromium-experimental-timestamp-query-inside-passes'])
+    if (R.adapter.features.has(f)) req.push(f);
+  R.device = await R.adapter.requestDevice({ requiredFeatures: req });
+  R.device.onuncapturederror = e => pushErr('GPU: ' + e.error.message.split('\n')[0]);
+  R.ctx = canvas.getContext('webgpu');
+  R.canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+  R.ctx.configure({ device: R.device, format: R.canvasFormat, alphaMode: 'opaque',
+                    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+                    preserveDrawingBuffer: Q.has('dbg') });
+  R.sampler = R.device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressMode: 'clamp-to-edge' });
+  R.ubo = R.device.createBuffer({ size: F.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  initLayouts();
+  buildWorld();
+  BG.global = R.device.createBindGroup({
+    layout: LAYOUT.sceneBGL,
+    entries: [{ binding: 0, resource: { buffer: R.ubo } }],
+  });
+  buildPasses();
+  tsInit();
+  R.rebuildTargets = rebuildTargets;
+  resize();
+  window.addEventListener('resize', () => resize());
+  if (Q.has('pose')) API.setPose(parseInt(Q.get('pose'), 10) || 0);
+  if (Q.has('tour')) API.startTour(qp('tour', 30));
+  R.ready = true;
+  ovGpu.textContent = 'webgpu ok - ' + R.canvasFormat + ' - msaa x' + R.samples;
+  RUNNING = true; lastNow = performance.now();
+  if (PERF.mode === 'live') rafId = requestAnimationFrame(liveTick); else syncLoop();
+}
+boot();
+</script>
+</body>
+</html>
+
+
+
+
