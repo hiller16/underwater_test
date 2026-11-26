@@ -1,5 +1,12 @@
 {
+  "name": "kelp-cathedral",
+  "private": true,
+  "scripts": {
+    "check": "node tools/check.js",
+    "test": "node tests/verify.js"
+  },
   "dependencies": {
     "esbuild": "^0.28.2"
   }
 }
+
