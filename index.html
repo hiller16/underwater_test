@@ -668,8 +668,10 @@ const WGSL_KELP = WGSL_COMMON + `
   // translucent rim: the edge of a blade glows with the up-welling water light, which
   // is what stops a leaf from reading as a flat cut-out against the haze
   col += waterTint(max(u.camBasis.z - wp.y, 0.0)) * cube(max(1.0 - abs(dot(n, dir)), 0.0)) * 0.75 * thin;
-  // blades brushing the lens dissolve into the haze instead of smearing a polygon
-  if (dist < 3.2) { col = mix(waterInscat(wp, dir, 0.0), col, sstep(0.45, 3.2, dist)); }
+  // Blades brushing the lens dissolve into the haze instead of smearing a polygon over
+  // the composition. The window is deliberately wide: at 72 deg fov a stipe 5 m away
+  // already covers a third of the frame, and a hard-cut green column reads as a bug.
+  if (dist < 6.5) { col = mix(waterInscat(wp, dir, 0.0), col, 0.15 + 0.85 * sstep(1.2, 6.5, dist)); }
   return vec4<f32>(fogBlend(col, dist, mix(u.camPos.xyz, wp, 0.5), dir, 0.0), 1.0);
 }
 `;
