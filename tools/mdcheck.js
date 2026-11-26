@@ -4,12 +4,12 @@
 // cause of a broken row - a table that renders as a wall of text is a doc bug, and this
 // catches it without opening a browser.
 //
-//   node tools/mdcheck.js [file.md ...]     default: the three docs this project ships
+//   node tools/mdcheck.js [file.md ...]     default: README plus the docs this project ships
 // Exit code 1 when any row mismatches, so it can gate a docs change.
 const fs = require('fs'), path = require('path');
 const ROOT = path.resolve(__dirname, '..');
 const files = process.argv.slice(2).filter(a => !a.startsWith('-'));
-if (!files.length) files.push('docs/progress.md', 'docs/reports/perf.md', 'docs/reports/critic.md');
+if (!files.length) files.push('README.md', 'docs/progress.md', 'docs/reports/perf.md', 'docs/reports/critic.md');
 let badTotal = 0;
 for (const rel of files) {
   const f = path.isAbsolute(rel) ? rel : path.join(ROOT, rel);

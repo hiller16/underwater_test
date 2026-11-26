@@ -1,3 +1,5 @@
 node_modules/
 # 驗證輸出（截圖、效能 log、裁切預覽）：都能用 tools/ 重新產生
 _*/
+# tools/sheet.js 在輸出目錄留下的暫存網頁（每次都重建，不進版控）
+.sheet-*.html

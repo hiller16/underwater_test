@@ -441,6 +441,10 @@ node tools\dbg.js --param "hide=kelp,props" --eval "__scene.setPose(0)" --shot _
    ＋ `docs/reports/perf.md`（環境、負載實例數、1200p/1080p 結果、per-pass、timestamp 限制、量測陷阱、重現指令）
    ＋ `docs/reports/critic.md`（方法、六輪摘要與缺陷→修法→驗證、最終判定、保留的取捨、判讀限制）。
    本檔 §2.1／§2.2 仍是原始留檔，報告是整理版；數字若要更新兩邊都要改。
+   **2026-11-26 補上 `README.md`**（倉庫首頁用法文件：執行需求、操作鍵、URL 參數、`window.__scene` API、
+   `npm.cmd` 指令、`tools/` 一覽、1200p 效能、文件索引、已知限制），頂部配圖 `docs/preview.jpg`
+   （960×810、201 KB，由 `_readme/` 六格 1920×1080 JPEG 經 `tools/sheet.js --cols 2 --w 960` 產生，可重跑）；
+   `tools/mdcheck.js` 的預設清單因此加入 `README.md`（現在預設查 4 份文件）。
 3. **可選（低 CP）**：
    - ~~tour 仍有一格偏平淡（f006）~~ **第 7 輪已做**：`TOUR_WP` 第 7 點 y 24→10（延後爬升、快速穿過葉帶），
      tour 12 格 edgeMin 3.0802 → **3.7060**、edgeAvg 5.5754 → **5.6673**（見 §2.1 第 7 輪）。
