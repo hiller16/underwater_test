@@ -383,6 +383,7 @@ juvenile 0.17→0.24，第 4 輪再加每株約 270 個氣囊頂點 ≈ +39% kel
 | `band.js` | PNG 的 banding 檢查（不用瀏覽器）：每欄往下找 ≥2 LSB 的「台階」＋平坦塊色階使用率；`--selftest` 用合成梯度自證判別力 | `node tools\band.js _rev13p\pose1-look-up-surface.png` |
 | `edges.js` | 一次印多張圖的 edge/std/mean（改前後比較結構量） | `node tools\edges.js _b0\tour baseline_20s_1280x720` |
 | `tourprobe.js` | 不靠看圖找出 fly-through 哪一格為何沒結構：重現 `shoot.js` 的取樣時間，印每格相機位置與「前向錐內的巨藻數／最近距離／貼鏡莖」 | `node tools\tourprobe.js 20` |
+| `mdcheck.js` | 文件表格欄數檢查（不用瀏覽器）：同一表格每列的欄數要與標題一致，儲存格內未跳脫的豎線是最常見殺手；有錯 exit 1 | `node tools\mdcheck.js`（預設查 progress + 兩份報告） |
 | `diff.js` | 兩張 PNG 逐像素差異：changed pct、maxAbs、bbox、changed2（>2 LSB）；`--mask=x,y,w,h` 遮掉 HUD（它的 FPS 數字每張都變）；搭配 `?time=<sec>` 與 URL `hide=` 隔离圖層 | `node tools\diff.js _bb2_on\pose5-deep-arch.png _bb2_off\pose5-deep-arch.png 3 --mask=0,0,300,52` |
 | `sheet.js` | 用瀏覽器把多張圖排成帶標籤的 contact sheet（JPG） | `node tools\sheet.js --out _view\g1.jpg --cols 3 --w 1080 _rev8\pose0*.png ...` |
 | `montage.js` | 純 Node 版 contact sheet（輸出 PNG，不啟動瀏覽器） | `node tools\montage.js _view\m.png --cols 3 --w 480 a.png b.png` |
