@@ -210,6 +210,22 @@ critic 清單的累計處理進度：
   （`tools/edges.js _rev14t\tour` 對照 `_b0\tour`）。
 - 兩個 run 都 `errors: []`；`npm.cmd test` 17/17。判定：**停止條件維持成立**，可進入交付。
 
+#### 第 7 輪（低 CP 項）：讓 tour 路徑繞開藻冠（`_tv1`）
+
+`_rev14t` 最差的一格是 f006（edge 3.0802）。新增 `tools/tourprobe.js` 沿 `shoot.js` 的取樣時間還原相機位置再數巨藻：
+f006 停在**水面下 36 m、pitch +0.36 仰視**，前向錐內只有 5 株且最近 10.6 m → 畫格內容是「幾片散葉飄在亮水裡」，
+不是貼鏡糊住（那是 f005，最近一株 0.7 m）。
+
+| 變體 | 改了什麼 | edgeAvg | edgeMin | stdMin | 判定 |
+|---|---|---|---|---|---|
+| baseline `_rev14t` | — | 5.5754 | 3.0802 | 24.67 | — |
+| **B（採用）** | `TOUR_WP` 第 7 點 y 24 → **10**：爬升延後，一次衝穿葉帶而不是停在帶中間 | **5.6673** | **3.7060**（+20%） | **28.76** | 對照圖 `_view/tour_f6.jpg`：舊格＝一張貼鏡葉＋大片藍水；新格＝分層冠層＋魚群與氣泡 |
+| C（不採用） | 再把第 7/8 點 dx 24→16、12→8（往河道中心，那裏藻被 `smoothstep(11,48,dd)` 壓得更疏） | 5.0865 | 2.8052 | 25.10 | 變成開闊水面，最差格換到 f004/f005（2.81／2.85）——疏到沒有結構，故放棄 |
+
+回歸檢查（`CAMPTS` 含 120 個 tour 取樣點，改路徑會連動 `placeFlora` 的稀釋環，所以 pose 也要複核）：
+用 `git stash` 做前後 A/B（`_poseBase` vs `_poseB`，@1280×720），6 個 critic pose
+**edgeAvg 5.4306 → 5.4443**、逐格 ±0.10、`scan.js` 六格 **0 blobs**、兩個 run `errors: []`。
+
 
 ### 2.2 效能（scripted fly-through，fenced = 每幀等 `onSubmittedWorkDone`）
 
@@ -217,7 +233,8 @@ critic 清單的累計處理進度：
 
 | run | size | 條件 | frames | avg | p50 | p99 | p999 | max | 0.1% low (fps) |
 |---|---|---|---|---|---|---|---|---|---|
-| `_perf1200b` | 1920×1200 | `--perf`（vsync，20 s tour，**第 5 輪最終狀態**：葉緣鋸齒＋中肋＋舷帶） | 2362 | 8.47 | 5.6 | 22.1 | 22.3 | 22.4 | 44.6 |
+| `_perf1200c` | 1920×1200 | `--perf`（vsync，20 s tour，**第 7 輪最終狀態**：延後爬升的 tour 路徑） | 2144 | 9.33 | 5.6 | 22.2 | 22.3 | 27.8 | 36.0 |
+| `_perf1200b` | 1920×1200 | `--perf`（vsync，20 s tour，第 5 輪狀態：葉緣鋸齒＋中肋＋舷帶） | 2362 | 8.47 | 5.6 | 22.1 | 22.3 | 22.4 | 44.6 |
 | `_perf1200` | 1920×1200 | `--perf`（vsync，30 s tour，minor (c) 之前） | 3744 | 8.01 | 5.6 | 22.1 | 22.3 | 27.7 | 36.1 |
 | `_perf1200n` | 1920×1200 | `--perf --nolimit`（關 vsync，20 s tour） | 2559 | 7.82 | 7.5 | 12.6 | 14.2 | 17.0 | 58.8 |
 | `_t_perf` | 1920×1080 | `--perf`（vsync，8 s tour，第 4 輪最終狀態） | 964 | 8.32 | 5.6 | 16.8 | 22.2 | 22.3 | 44.8 |
@@ -227,7 +244,8 @@ critic 清單的累計處理進度：
 | `_perf5` | 1920×1080 | `--perf`（vsync 180 Hz） | 3041 | 7.90 | 5.6 | 22.3 | 27.8 | 33.4 | 29.9 |
 | `_perf4` | 1920×1200 | `--perf`（vsync） | 4096 | 6.82 | 5.6 | 16.8 | 16.9 | 22.2 | 45.0 |
 
-GPU 端（`gpuMs`，同一 submit 的 fence 往返）：**`_perf1200b`（最終狀態）avg 7.41 / p50 6.8 / p99 12.3 / max 16.8**；
+GPU 端（`gpuMs`，同一 submit 的 fence 往返）：**`_perf1200c`（最終狀態）avg 7.89 / p50 7.7 / p99 12.2 / max 21.8**；
+**`_perf1200b`（第 5 輪狀態）avg 7.41 / p50 6.8 / p99 12.3 / max 16.8**；
 `_perf1200` avg 7.03 / p99 11.9 / max 18.3；`_perf1200n`（關 vsync）avg 7.65 / p99 12.2 / max 16.4；
 `_t_perf` avg 7.29 / p99 11.8 / max 15.4；`_rev10p` avg 7.47 / p99 19.2 / max 24.7；
 `_fix2p` avg 6.23 / p99 10.4 / max 12.3；舊版 1080p avg 5.7 / p99 8.9 / max 19.7。
@@ -339,6 +357,7 @@ juvenile 0.17→0.24，第 4 輪再加每株約 270 個氣囊頂點 ≈ +39% kel
 | `crop.js` | 純 Node 裁剪/放大 PNG → 新 PNG（看細節用）；**scale 建議整數**，第 5 輪已修掉非整數寬度導致瀏覽器解出黑 tile 的問題 | `node tools\crop.js in.png 440 190 400 300 1 out.png` |
 | `band.js` | PNG 的 banding 檢查（不用瀏覽器）：每欄往下找 ≥2 LSB 的「台階」＋平坦塊色階使用率；`--selftest` 用合成梯度自證判別力 | `node tools\band.js _rev13p\pose1-look-up-surface.png` |
 | `edges.js` | 一次印多張圖的 edge/std/mean（改前後比較結構量） | `node tools\edges.js _b0\tour baseline_20s_1280x720` |
+| `tourprobe.js` | 不靠看圖找出 fly-through 哪一格為何沒結構：重現 `shoot.js` 的取樣時間，印每格相機位置與「前向錐內的巨藻數／最近距離／貼鏡莖」 | `node tools\tourprobe.js 20` |
 | `diff.js` | 兩張 PNG 逐像素差異：changed pct、maxAbs、bbox（搭配 `?time=` 與 `hide=` 隔离圖層） | `node tools\diff.js _v4\p3_a.png _v4\p3_b.png` |
 | `sheet.js` | 用瀏覽器把多張圖排成帶標籤的 contact sheet（JPG） | `node tools\sheet.js --out _view\g1.jpg --cols 3 --w 1080 _rev8\pose0*.png ...` |
 | `montage.js` | 純 Node 版 contact sheet（輸出 PNG，不啟動瀏覽器） | `node tools\montage.js _view\m.png --cols 3 --w 480 a.png b.png` |
@@ -394,9 +413,10 @@ node tools\dbg.js --param "hide=kelp,props" --eval "__scene.setPose(0)" --shot _
    ＋ `docs/reports/critic.md`（方法、六輪摘要與缺陷→修法→驗證、最終判定、保留的取捨、判讀限制）。
    本檔 §2.1／§2.2 仍是原始留檔，報告是整理版；數字若要更新兩邊都要改。
 3. **可選（低 CP）**：
-   - tour 仍有一格偏平淡（`_rev14t` 的 f006，edge 3.08）——要嘛改 `tourSample()` 的 y／橫向相位繞開藻冠，
-     要嘛接受為穿林過場；驗收 `node tools\shoot.js --size 1280x720 --poses none --tour 20 --tour-frames 12 --out _tour2`
-     ＋ `node tools\edges.js _tour2\tour`（現況 edgeAvg 5.5754／edgeMin 3.0802）。
+   - ~~tour 仍有一格偏平淡（f006）~~ **第 7 輪已做**：`TOUR_WP` 第 7 點 y 24→10（延後爬升、快速穿過葉帶），
+     tour 12 格 edgeMin 3.0802 → **3.7060**、edgeAvg 5.5754 → **5.6673**（見 §2.1 第 7 輪）。
+     驗收指令：`node tools\shoot.js --size 1280x720 --poses none --tour 20 --tour-frames 12 --out _tour2`
+     ＋ `node tools\edges.js _tour2\tour`；要查是哪一段的問題用 `node tools\tourprobe.js 20`。
    - per-pass 計時要不要正式定位成「submit-fence 量測」寫進報告（P1 #6）；氣泡逐格辨識度（P2 #8 剩餘）。
 4. **接手必讀**：本檔 §5（做什麼）＋ §4（工具怎么用）＋ §1 缺陷表最後三列（WGSL 不支援巢狀三元運算子、
    `crop.js` 非整數寬度會解出黑 tile、`verify.js` 的 rAF 斷言要抗 GPU 搶佔）；改 shader 後一定看 `shoot.js` 的 `errors`。
