@@ -437,6 +437,10 @@ node tools\dbg.js --param "hide=kelp,props" --eval "__scene.setPose(0)" --shot _
    `_poseBase`／`_poseB`、`_fix*`、`_t_*`、`_diag`）是數字的出處，都能用 §4 的指令重跑，不必留檔。
    重跑整套覆核：`node tools\shoot.js --size 1920x1080 --out _rev15 --settle 1500`
    ＋ `node tools\shoot.js --size 1280x720 --poses none --tour 20 --tour-frames 12 --out _rev15t`。
+   **其後依使用者確認全部刪除（2026-11-26）**：最後 6 個 `_` 目錄（`_view`、`_bb2_on`／`_bb2_off`、
+   `_perf1200d`、`_tv1`、`_readme`，共 40.8 MB）也清掉了，本機目前沒有任何 `_` 目錄（git 從來沒追蹤它們）。
+   唯一留下的圖片是版控內的 `docs/preview.jpg`（README 配圖）。刪除後冒煙測試
+   `node tools\shoot.js --size 960x540 --poses 0 --out _smoke --settle 900 --fmt jpeg` → `errors: []`、exit 0。
 2. **交付三件套**（計畫 WP9）：**已完成**——`index.html`（138.5 KiB raw / 94.1 KiB min / 33.3 KiB gzip，第 8 輪狀態）
    ＋ `docs/reports/perf.md`（環境、負載實例數、1200p/1080p 結果、per-pass、timestamp 限制、量測陷阱、重現指令）
    ＋ `docs/reports/critic.md`（方法、六輪摘要與缺陷→修法→驗證、最終判定、保留的取捨、判讀限制）。
