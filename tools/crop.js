@@ -8,7 +8,10 @@ const im = decode(file);
 let x = +xs, y = +ys, w = +ws, h = +hs, sc = ss ? +ss : 1;
 x = Math.max(0, Math.min(im.w - 1, x)); y = Math.max(0, Math.min(im.h - 1, y));
 w = Math.min(w, im.w - x); h = Math.min(h, im.h - y);
-const W = w * sc, H = h * sc;
+// Integer output size: a fractional scale (e.g. 1.25 on a 470 px crop) used to write a
+// truncated width into IHDR while the rows kept the fractional stride, so the browser
+// decoded the PNG misaligned and the tile came out black.
+const W = Math.max(1, Math.round(w * sc)), H = Math.max(1, Math.round(h * sc));
 const raw = Buffer.alloc(H * (1 + W * 3));
 let p = 0;
 for (let j = 0; j < H; j++) {
