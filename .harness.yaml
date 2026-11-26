@@ -9,7 +9,7 @@ name: project_02
 verify:
   # 驗收指令：在專案根目錄用 shell 執行。檔案有變動時環境就跑一次，結果附給模型。
   # 大型專案可以只填相關的那組測試，每次都跑完整套件會拖慢每一輪。
-  cmd: npm test
+  cmd: harness:html-check
   # 輸出格式：auto 自動判斷（node:test、TAP、jest、vitest、pytest、PASS／FAIL 都認得）。
   # 想要「之前通過、這次失敗」逐項比對，測試工具要列出每一項的名稱：
   #   jest 加 --verbose、vitest 加 --reporter=verbose、pytest 加 -v；node:test 預設就有。

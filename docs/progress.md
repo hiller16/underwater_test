@@ -67,8 +67,25 @@
 ## 2. 驗證結果
 
 ### 2.1 Visual critic（只准看 render，不準看 code）
-狀態：**尚未通過**。最新一輪（`_rev8`，6 poses @1280×720，無 error）之後就再也讀不到圖片，
-所以「set piece 重整方向 + god ray 加固 + 海面亮度下修」這批變更尚無肉眼簽核。
+狀態：**尚未通過（有 blocker）**。本輪 `_rev9`：6 poses @1920×1080、`errors: []`、12 s 跑完，
+拼成 `_view/c9.jpg`（960×810、190 KB）一張讀完。上一輪之後的「set piece 轉向 + god ray 加固 +
+海面亮度下修」現在有肉眼結果：道具轉向确实有到（不再看到側邊/細片），但 set piece 仍不好認，
+而亮度問題從「黑」變成另一頭「白」。
+
+#### 本輪缺陷清單（依嚴重度）
+| # | 等級 | 缺陷 | 出現在 | 建議方向 |
+|---|---|---|---|---|
+| 1 | **blocker** | Set piece 辨識度不足：pose2 的船殼只剩左中一段深灰長條、被 kelp 切掉；pose3 找不到鯨尾石雕；pose5 的拱門像一根細彎管/馬蹄鐵，沒有岩質與厚度 | 2、3、5 | 清出道具視線（走廊半徑再放大或對準 pose）、arch 由岩壁擠出而非 tube、fluke 加基座與附著生 |
+| 2 | major | Kelp 讀成「竹竿 + 飄落的楓葉」：莖是筆直等徑的純色圓柱，葉是小扁片隨機方向，沒有長葉帶與頂冠 → 缺了巨藻林的主 signature | 全部 | 葉改成沿莖的長帶（寬度隨高度漸變、頂部成冠）；莖加弧度與粗細變化 |
+| 3 | major | 白霧過曝（milky）：上半部／太陽方向洗成接近純白、沒有漸層與結構，god ray 看不到明確光柱 | 1（右半整片白）、2、4（上半）、0（中右） | in-scatter 設亮度上限、太陽近旁交給 bloom；god ray 提高對比但別把中間調洗白 |
+| 4 | major | 近景巨莖硬切構圖：pose0 右側一整條巨大綠柱、pose1 中央一根粗莖變成主體，沒有淡出或剔除 | 0、1、3 | 距鏡頭 <~2.5 m 的 kelp 淡出／剔除，或相機推擠 |
+| 5 | major | 地面洋紅過飽和：前景紫紅與上方冷調分裂，像兩張圖拼起來 | 3（最明顯）、0、4、5 | magenta 依深度往霧色插值、縮小連續面積（摻條紋/斑塊） |
+| 6 | minor | 葉片像無透光紙卡片：邊緣硬、無透光與色相漸層，specks 只點亮小塊 | 3、4 | 葉加薄壁透光（back-light）+ 沿葉漸層，A2C 邊緣軟化 |
+| 7 | minor | 生命體不可見：這 6 格看不出魚群/蝠鱝/氣泡，只有零星小黑點 | 0、2、5 | 魚群路徑收進 pose 視野、氣泡柱加密並移近鏡頭 |
+| 8 | minor | 遠景岩壁 blocky 雜訊：crackle/hash 在遠處仍成小方塊 | 5、2 | 更早淡出高頻項，遠處改低頻色變異 |
+| 9 | minor | pose1 白色漸層疑似輕微 banding（JPEG 下不能定案） | 1 | 用 1280×720 PNG + `png.js` 複查 gradient |
+
+停止條件（無 major 以上、minor 收斂）未達成 → #1–#5 修完再跑一輪。
 
 已經用數值工具確認的部分（`tools/region.js`，edge = 邊緣能量、std = 對比）：
 
@@ -131,10 +148,10 @@ GPU 端（`gpuMs`，同一 submit 的 fence 往返）：1080p avg 5.7 / p99 8.9 
 ## 3. 還沒解決的問題（依優先順序）
 
 **P0 — 完成門檻本身**
-1. **Visual critic 需要重新跑一輪簽核**：以目前 build 輸出 6 poses @1920×1080 + tour 截圖序列，
-   由「只看圖」的 critic 判定；目標是没有任何項目高於 minor。
-   重點複核：船殼/鯨尾可辨识度、god ray 強度（要明顯但不把中間調洗白）、
-   近距離巨藻葉片過大過平、紫色地面飽和度、banding。
+1. **Visual critic：本輪已跑完並出清單（見 §2.1），結果「尚未通過，1 blocker + 4 major」**。
+   下一輪要修的是：#1 set piece 辨識度（blocker）、#2 kelp 造型（竹竿+飄葉 → 長葉帶+頂冠）、
+   #3 白霧過曝/god ray 不明顯、#4 近景巨莖硬切構圖、#5 地面洋紅過飽和。
+   tour 截圖序列本轮未跑（留給修完後的複核輪）。
 2. **圖片通道**：上一輪 session `read_files` 讀 PNG/JPG 一律 `media omitted`
    （378 KB～1 MB 都試過，舊檔也一樣），肉眼覆核被迫暫停，
    當時靠 `ascii.js / region.js / scan.js` 撐住組合與數值判斷。
@@ -218,7 +235,13 @@ node tools\dbg.js --param "hide=kelp,props" --eval "__scene.setPose(0)" --shot _
 ---
 
 ## 5. 下一步（順序）
-1. 圖片通道恢復後，重跑 6 poses @1920×1080 + tour 序列，交給 critic 出清單。
-2. 依清單修 P0/P2 視覺項。
-3. 重測 1920×1200（--perf 與 --profile），把 avg / p99 / max 寫進交付報告。
-4. 清理暫存目錄，交付 `index.html` + 體積 + 效能報告 + critic 最終評語。
+1. 修 §2.1 的 #1（blocker）set piece 辨識度：清出 pose2/pose3 視線（走廊或道具剔除半徑再放大）、
+   arch 改由岩壁擠出（不要細 tube）、fluke 加基座與附著生；每改一項用
+   `shoot.js --poses 2,3,5 --fmt jpeg` + `sheet.js --cols 2 --w 960` 覆核（一張圖）。
+2. 修 #2 kelp 造型（影響最大，單獨一個 commit）：葉片改成沿莖的長帶 + 頂冠，莖加弧度與粗細變化。
+3. 修 #3 白霧過曝／god ray（in-scatter 亮度上限、太陽近旁交給 bloom）、#4 近景 kelp 淡出、
+   #5 地面 magenta 依深度往霧色插值。
+4. 重跑 6 poses @1920×1080（`_rev10`）+ tour 截圖序列，直到沒有 major。
+5. 重測 1920×1200（`--perf` 與 `--profile`），把 avg / p99 / max 寫進 `docs/reports/perf.md`。
+6. 補 `tests/verify.js` + `npm test`（WP9，環境驗收現在是 Missing script），
+   清理暫存目錄，交付 `index.html` + 體積 + 效能報告 + critic 最終評語。
