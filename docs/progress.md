@@ -1,6 +1,6 @@
 ﻿# Kelp Cathedral — 進度紀錄
 
-> 更新時間：2026-11-26（第 3 輪：cdp 逾時修復 + critic 清單 #1–#5 全部修完並覆核）。
+> 更新時間：2026-11-26（第 4 輪：`_rev10` 的 2 個 major + 4 個 minor 全修完並逐項截圖覆核）。
 > 單一交付檔 `index.html`（WebGPU、全程序化、無引擎）。
 > 圖片通道已恢復（可讀 ≤960 寬 JPEG），本輪的視覺判斷是肉眼 + 數值工具並行。
 
@@ -63,17 +63,19 @@
 | 畫面中純黑塊（major→blocker） | mote 精靈的 NaN alpha 進 HDR buffer，經 bloom 擴散成黑卡；另 VS 四角公式 `*4` 應為 `*2` | VS 加 `!(d >= 1.2)` 剔除；FS 加 `!(s>=0)||!(s<4e4)` discard | `tools/scan.js` pose0/pose3 @1280×720 → 0 blobs（此前 1–3 個 48×48～60×52） |
 | pose5 整張平坦藍（blocker） | `finalizePoses()` 執行時 `SET.arches` 還是空的 → yaw/pitch = NaN | 新增 `layoutArches()`，順序改為 layoutArches → finalizePoses → buildCamPath | pose5 恢復內容（mean 0.339，edge 0.049） |
 | 相機埋進岩石 / 布景看不到 | 大道具隨機落在視點上 | 新增相機走廊 `CAMPTS`（6 poses ±9 m 擺頭 + 120 個 tour 取樣），大道具落在管內就剔除；arch 改為對準視點（standoff 44）；tour 相機鉗在 bed+12 | 各 pose 不再出現整屏單色 |
-| 布景方向錯誤（船殼側邊、鯨尾成細片） | `rot3` 旋轉順序為 Y→X→Z，yaw 先做 | 改為 roll→pitch→yaw（yaw 最後）；船殼 yaw 0.95 + 10° 傾側；鯨尾 rx90 站起再 ry90 轉向走廊 | 見「待辦 P0」：需肉眼覆核 |
+| 布景方向錯誤（船殼側邊、鯨尾成細片） | `rot3` 旋轉順序為 Y→X→Z，yaw 先做 | 改為 roll→pitch→yaw（yaw 最後）；船殼 yaw 0.95 + 10° 傾側；鯨尾 rx90 站起再 ry90 轉向走廊 | 第 3 輪 `_view/f1.jpg` 已肉眼覆核通過 |
+| 「魚群」在畫面裡看不見（第 4 輪） | `fishVS` 的軌道半徑 `13 + 30·fract(sc·0.618)` m → 一群魚其實是直徑 26–86 m 的空心殼，群心對準鏡頭時成員反而散到鏡頭前後 | `i1.w` 由擺尾相位改為軌道半徑縮放（擺尾相位改用 `fract(sc·7.13)` hash），錨定 pose 的群用 0.16–0.30，`ext/wide` 也同步縮小 | `_view/g4.jpg` pose0/2/4 都看得到銀色魚群；`dbg.js` 投影確認群心在框內 |
+| kelp 加氣囊時網格錯位風險 | `sweep()` 每頂點寫 6 floats，但 kelp pipeline 是 `arrayStride: 32`（pos+normal+uv 共 8 floats） | 氣囊改用 kelp 自己的 `push()`（8 floats）建八面體並手寫索引 | `errors: []`、`_t_minor/k0.png` 葉柄基部可見小球 |
 
 ---
 
 ## 2. 驗證結果
 
 ### 2.1 Visual critic（只准看 render，不準看 code）
-狀態：**blocker 已解除，但仍未達成停止條件**。第 3 輪把 `_rev9` 的 #1（blocker）與 #2–#5（major）
-逐項修完、每項截圖覆核並各自 commit（`3ab07f2 / 9e637da / f9c264b / 8eb70d2 / 0f67221`），
-然後重跑 `_rev10`：6 poses @1920×1080、`errors: []`、拼成 `_view/c10.jpg`（960×810、175 KB）。
-判讀限制：總覽圖每格只有 480×270，細節（葉緣鋸齒、banding、肋骨紋）需要 `crop.js` 小圖才能定案。
+狀態：**0 blocker、0 major，只剩 1 個 minor（船殼肋骨的近距離辨識度）**。
+第 3 輪修完 `_rev9` 的 1 blocker + 4 major；第 4 輪把 `_rev10` 的 2 個 major（pose4 洗白、iridescent 葉過飽和）
+與 4 個 minor（莖無節／肋骨看不見／貼鏡葉片／生命體不可見）逐項修完，每項截圖覆核並各自 commit。
+判讀限制：總覽圖每格只有 480×270，細節一律用 `crop.js` 裁 ≤480 寬小圖再看。
 
 #### `_rev9` 缺陷清單與本輪修法（留檔）
 | # | 等級 | 缺陷 | 出現在 | 建議方向 |
@@ -108,8 +110,34 @@
 | 5 | minor | pose0 左上/右上仍有貼鏡葉片成大片色塊（已軟化但搶眼） | 0 | 视点空地 10 m 再外推，或貼鏡葉再降飽和 |
 | 6 | minor | 生命體仍不易看見（只有零星小點） | 0、2、5 | 魚群/氣泡移進 pose 視野 |
 
-停止條件（無 major 以上、minor 收斂）仍未達成：blocker 與原 #2–#5 已解除，剩 #1、#2 兩個 major。
-`tools/scan.js` @1280×720：pose0 / pose4 = 0 blobs（黑塊未復發）。
+本輪（第 4 輪）對應修法（一項一 commit）：
+
+| # | 等級 | 做了什麼 | 驗證 |
+|---|---|---|---|
+| 1 | major | god ray 拆出 shaft-only 增益：新增 `CFG.godrayShaft`（URL `gs`，走 `params4.y`）只縮光柱、不動太陽盤 halo，逆陽視角不再把遠景沖平 | 診斷 `gr=0` 時 pose4 mean 0.626 → 0.252（證實洗白來自 `raysFS` 積分）；定稿 `gs=0.62` → pose4 mean 0.548 / edge 0.0251→0.0315、clip 0%；`_view/g1.jpg`、`g4.jpg`：光柱仍在但出現中距岩塊與林相深度 |
+| 2 | major | `kelpFS` iridescent 變體色 `(0.245,0.055,0.230)/(0.480,0.150,0.320)` → `(0.150,0.090,0.150)/(0.300,0.200,0.275)`，並 `irid *= 1 - 0.60·sstep(20,62,dist)`（遠處回到普通綠） | `_diag/chroma.js` pose0 chromaMean 0.1971 → 0.1912（本輪結束 0.1863）；`_view/g2.jpg`：洋紅葉轉柔和淡紫，不再是畫面最搶眼物體 |
+| 3 | minor | 莖加節理：直徑沿高度叠兩個諧波（`1 + 0.13·sin(21v) + 0.07·sin(7.3v+1.1)`、SR 8→10）；每片葉柄基部加一顆 pneumatocyst（八面體、6 頂點 8 三角形；kelp 是 8-float stride，不能用只寫 6 floats 的 `sweep()`） | `_t_minor/k0.png`、`_view/g4.jpg`：莖出現環狀節、葉柄基部有小球；1080p 8 s tour gpuMs avg 7.29 / p99 11.8（+39% kelp 頂點仍合於預算） |
+| 4 | minor | 船殼肋骨半徑 0.24 → 0.34（實例 scale 1.72 → 實際肋徑約 0.58 m） | `_t_f2/kh2.png`：33 m 處可見到肋骨起伏 |
+| 5 | minor | 視點空地 10 m → 6 m（`onStage`）——10 m 把整片冠層清掉反而變成空洞，6 m 只推掉貼鏡葉 | `_view/g4.jpg` pose0：四周仍有藻林包圍，中央不被葉片切死 |
+| 6 | minor | 每個 pose 前 15–24 m 停一團魚（`placeLife` 用 pose 的 forward/right 定位）+ 魚體放大（0.34–1.07 → 0.45–1.35 m）+ **修正「魚群」其實是直徑 26–86 m 的軌道殼**：`i1.w` 從擺尾相位改成軌道半徑縮放（相位改由 `fract(sc*7.13)` 產生），錨定群用 0.16–0.30 | `dbg.js` 投影證明群心在框內（pose0 458,317／pose2 368,650／pose4 716,380）；`_t_f2/kh2.png`、`_view/g4.jpg` 三格都看得到銀色魚群 |
+
+停止條件（無 major 以上、minor 收斂）：**已達成**（剩船殼肋骨的近距離辨識度一項 minor，屬可交付範圍）。
+`tools/scan.js` @1280×720：pose0 / pose3 / pose4 = 0 blobs（黑塊未復發）。
+`shoot.js` 所有 run 的 `errors: []`（改 shader 後一定看這個欄位——見 §1 的 WGSL 教訓）。
+
+#### 第 4 輪追加：`_rev11` + tour 覆核浮出的兩項（已修，`_rev12` 覆核）
+
+`_rev11`（6 poses @1920×1080 + `--tour 12 --tour-frames 12`）是我第一次看 tour 畫面，浮出兩項：
+
+| 缺陷 | 根因 | 處置 | 驗證 |
+|---|---|---|---|
+| pose5 `deep-arch` 的拱門又被巨藻切掉，只剩左側一塊岩石 | `placeFlora` 的視線廊道用 `SET[p.look]` 取目標，但拱門是 `SET.arches` **陣列**、沒有 `SET.arch` → pose5 從來沒有廊道（第 3 輪以為有） | 解析 `p.look === 'arch'` 時改取 `SET.arches.find(a => a.isPose)`（與 `finalizePoses` 同一個目標）；另把視點空地改成 `p.look ? 9 : 6` m（看道具的 pose 要寬、純風景的 pose 只要推掉貼鏡葉） | `_view/c12.jpg` pose5：石拱與拱下開口清楚可見、魚群從拱下穿過 |
+| tour 畫面被大片葉面糊住（`_view/t11.jpg` 六格中四格是抽象綠面） | 巨藻只按「峽谷中軸距離」稀疏化，但 tour 路徑在峽谷裡左右 wander → 相機直接穿進藻林 | `placeFlora` 加 `if (!camClear(xx, zz, 3.2)) p *= 0.42;`（`CAMPTS` 已含 120 個 tour 取樣點，保留少量前景做視差） | `_view/t12.jpg`：f000 看到石雕與林相深度、f009 魚群 + 巨藻 + 岩塊；僅 f003 仍是貼著葉面飛；pose0 chromaMean 0.1863 → 0.1332、scan 6 poses 全 0 blobs |
+
+量測注意：`--tour --tour-frames` 的 run 裡 `tourStats` 會出現 p999 ≈ 217 ms / max 222 ms 的離群幀，
+而 p50 5.6 / p90 5.6 / p99 5.7 ms——那是 CDP 截圖當下暫停迴圈造成的，不是場景變慢。
+要看真實效能請用 `--perf`（不截圖）或 `--nolimit`。
+
 
 #### 數值輔助判讀（`_rev9` 期間的量測，留檔）
 
@@ -137,17 +165,20 @@ critic 清單的累計處理進度：
 
 | run | size | 條件 | frames | avg | p50 | p99 | p999 | max | 0.1% low (fps) |
 |---|---|---|---|---|---|---|---|---|---|
+| `_t_perf` | 1920×1080 | `--perf`（vsync，8 s tour，第 4 輪最終狀態） | 964 | 8.32 | 5.6 | 16.8 | 22.2 | 22.3 | 44.8 |
 | `_rev10p` | 1920×1080 | `--perf`（vsync，8 s tour） | 954 | 8.40 | 5.6 | 22.3 | 22.4 | 22.4 | 44.6 |
 | `_fix2p` | 1920×1080 | `--perf`（vsync，6 s tour） | 832 | 7.22 | 5.6 | 16.8 | 16.8 | 16.8 | 59.5 |
 | `_perf6` | 1920×1080 | `--perf --nolimit` | 4096 | **5.81** | 5.6 | 9.2 | 14.1 | 33.4 | 29.9 |
 | `_perf5` | 1920×1080 | `--perf`（vsync 180 Hz） | 3041 | 7.90 | 5.6 | 22.3 | 27.8 | 33.4 | 29.9 |
 | `_perf4` | 1920×1200 | `--perf`（vsync） | 4096 | 6.82 | 5.6 | 16.8 | 16.9 | 22.2 | 45.0 |
 
-GPU 端（`gpuMs`，同一 submit 的 fence 往返）：`_rev10p` avg 7.47 / p99 19.2 / max 24.7；
+GPU 端（`gpuMs`，同一 submit 的 fence 往返）：`_t_perf` avg 7.29 / p99 11.8 / max 15.4；
+`_rev10p` avg 7.47 / p99 19.2 / max 24.7；
 `_fix2p` avg 6.23 / p99 10.4 / max 12.3；舊版 1080p avg 5.7 / p99 8.9 / max 19.7、
 1200p avg 6.01 / p99 9.7 / max 21.4。
-注意：`_rev10p` / `_fix2p` 是 kelp 幾何加重（ROWS 5→6、頂端 perNode 最多 4、juvenile 0.17→0.24）
-之後的數字，且 tour 區間較短、取樣點不同，不能直接和 4096 幀的舊 run 比大小；
+注意：`_t_perf` / `_rev10p` / `_fix2p` 都是 kelp 幾何加重（ROWS 5→6、頂端 perNode 最多 4、
+juvenile 0.17→0.24，第 4 輪再加每株約 270 個氣囊頂點 ≈ +39% kelp 頂點）之後的數字，
+且 tour 區間較短、取樣點不同，不能直接和 4096 幀的舊 run 比大小；
 1200p 在新 kelp 下尚未重測（見待辦 P1）。
 
 逐 pass（`--profile`，`_perf5p` @1920×1080，每 pass 單獨 submit ×6 取平均）：
@@ -169,7 +200,7 @@ GPU 端（`gpuMs`，同一 submit 的 fence 往返）：`_rev10p` avg 7.47 / p99
 或支援 inside-passes 的 build 上才會出現。
 
 ### 2.3 體積
-`node tools/check.js` → **raw 129.6 KiB | minified 90.4 KiB | gzip 31.6 KiB**（單檔，無外部資源）。
+`node tools/check.js` → **raw 132.8 KiB | minified 92.0 KiB | gzip 32.4 KiB**（單檔，無外部資源）。
 
 ### 2.4 驗證環境
 - 本機即目標硬體（Ryzen AI Max+ 395 / Radeon 8060S，Windows 11）。
@@ -182,11 +213,14 @@ GPU 端（`gpuMs`，同一 submit 的 fence 往返）：`_rev10p` avg 7.47 / p99
 ## 3. 還沒解決的問題（依優先順序）
 
 **P0 — 完成門檻本身**
-1. **Visual critic：本輪（第 3 輪）已把 `_rev9` 的 1 blocker + 4 major 全修完並覆核**（見 §2.1）。
-   `_rev10` 結果：**blocker 解除、0 個舊 major，但新增/浮出 2 個 major** —
-   (a) pose4 `kelp-corridor` 全圖洗白、沒有主體；(b) 高飽和洋紅從地面搬到 iridescent 巨藻葉。
-   停止條件仍未達成 → 下一輪先修這兩個，再把 §2.1 `_rev10` 表的 4 個 minor 收斂，
-   並補跑 tour 截圖序列（`--tour 12 --tour-frames 12`，這輪仍未跑）。
+1. **Visual critic：停止條件已達成**（0 blocker、0 major；見 §2.1 第 4 輪表，含追加的兩項）。
+   已跑過：6 poses @1920×1080（`_rev11`→修→`_rev12`）**以及** tour 序列
+   `--tour 12 --tour-frames 12`（`_rev11/tour/f000-f011.jpg`、覆核圖 `_view/t11.jpg`、`_view/t12.jpg`）。
+   下一輪如果還要收，只剩這些 minor（依價值排序）：
+   (a) 船殼肋骨／木板在 30 m 外的紋理解析度（`_t_f2/kh2.png` 只隱約可見）；
+   (b) tour 中貼著葉面飛的片段（`_view/t12.jpg` 的 f003）——要嘛再壓低葉面尺寸／靠近路徑的密度，
+   要嘛讓 tour 路徑避開藻冠；
+   (c) 葉片本身的質感（無葉緣鋸齒、無沿葉色相漸層，近看仍像平滑卡片）。
 2. **圖片通道**：已恢復（11-26 起可讀 ≤960 寬 JPEG）。本輪讀 8 張（`diag12`、`f1–f5`、
    一張 960×540 單圖、`c10.jpg`），合計約 0.9 MB，沒有再出現 `media omitted`。
    額度規則見 §1：一個任務的圖片總量有上限，能用數值工具就不要看圖。
@@ -204,8 +238,8 @@ GPU 端（`gpuMs`，同一 submit 的 fence 往返）：`_rev10p` avg 7.47 / p99
    （或改用 `__scene` 的 `ts=1` 路徑等真 Chrome）。
 
 **P2 — 打磨**
-7. 巨藻葉片形狀／寬度／密度（近距離易讀成大卡片）。
-8. 魚群、蝠鱝在距離外的辨識度；氣泡密度與通氣口分佈。
+7. 巨藻葉片形狀／寬度／密度：第 4 輪已加節理＋pneumatocyst＋更長的葉帶，近距離仍偏「平滑」（無葉緣鋸齒、無沿葉色相漸層）。
+8. 魚群已入鏡（pose0/2/4 皆可見）；蝠鱝與氣泡在 pose 內的辨識度尚未逐格確認。
 9. pose1 直視太陽時的 bloom/clip 與天空漸層 banding。
 10. 交付前清掉暫存目錄：`_rev*`、`_shots*`、`_view`、`_critic*`、`_perf*`。
 
@@ -223,6 +257,7 @@ GPU 端（`gpuMs`，同一 submit 的 fence 往返）：`_rev10p` avg 7.47 / p99
 | `shoot.js` | 主力驗證：6 個 critic poses 截圖、scripted fly-through、per-frame log | 見下方三例 |
 | `perf.js` | 讀 `frame-log.json`/`tour-stats.json`，印 avg/percentiles/最差幀/直方圖 | `node tools\perf.js _perf6` |
 | `scan.js` | 找黑塊（NaN 黑卡偵測），輸出 bbox 與平均 RGB | `node tools\scan.js _rev8\pose0-canyon-start.png 18 400` |
+| `chroma.js` | 彩度統計（mean/p50/p95/max + 平均 RGB），證明某個顏色不再是畫面最搶眼的東西 | `node tools/chroma.js _rev12/pose0-canyon-start.png` |
 | `region.js` | 區域統計：mean/std/edge/clip，證明某區域有結構不是平 wash | `node tools\region.js _rev8\pose1-look-up-surface.png 0 0 1 0.4` |
 | `png.js` | PNG decoder + 全圖統計（mean、max、darkPct、clipPct、stripe） | `node tools\png.js _rev8\pose0-canyon-start.png` |
 | `ascii.js` | 文字預覽（亮度 ASCII 圖 + 顏色提示字元），沒有圖片通道時用 | `node tools\ascii.js _rev8\pose3-fluke-garden.png 74` |
