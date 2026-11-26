@@ -68,6 +68,8 @@
 | kelp 加氣囊時網格錯位風險 | `sweep()` 每頂點寫 6 floats，但 kelp pipeline 是 `arrayStride: 32`（pos+normal+uv 共 8 floats） | 氣囊改用 kelp 自己的 `push()`（8 floats）建八面體並手寫索引 | `errors: []`、`_t_minor/k0.png` 葉柄基部可見小球 |
 | `crop.js` 裁出的 tile 在瀏覽器裡全黑（第 5 輪） | 非整數 scale（470×1.25 = 587.5）時 IHDR 寬度被 `writeUInt32BE` 截斷成 587，而行距仍是 587.5×3 → 解碼錯位 | 輸出尺寸改 `Math.round(...)` 並設下限 1 | 同一裁切 `png.js mean` 0.3648（黑幀是 0）、contact sheet 由 3.8 KB 變成 55 KB |
 | `tests/verify.js` 第一版 7 項紅 | 我把 `cam.y` 拿去比 `POSES[i].z`；另外開頁後 1 s 內 rAF 還在編 pipeline，幀數幾乎不推進 | 索引改成 `cam.xz` 對 `POSES[i].xz`；量幀前先 `sleep(1200)` 讓迴圈穩定 | 17/17 passed、`npm.cmd test` exit 0 |
+| 圖層 A/B 誤判成「完全沒畫」（第 8 輪） | PowerShell 單引號不脫字：`--eval '__scene.hide(\"bub\")'` 把 `\"` 原樣傳給 node，eval 其實拋錯，hide 從未生效 → 對照兩張幀逐像素全等 | 圖層 A/B 一律用 **URL 參數**（`shoot.js --param "time=12&hide=bub"`，兩次 run）；`dbg.js --eval` 要帶字串就用雙引號外殼 | 同一幀改用 URL 參數後：氣泡 1787 px／maxAbs 198（原本是 0）；`hide=kelp` 對照 66.18% 畫素差異 |
+| `diff.js` 被 HUD 干擾 | HUD 的 FPS 數字每張圖都變，差分 bbox 一律被拉到左上角 15,12–183,25，把場景裡的真實貢獻淹掉 | 新增 `--mask=x,y,w,h`（跳過該矩形）與 `changed2`（>2 LSB 的畫素數）；同時修掉 `MASK` 為 null 時反向跳過全部像素的判斷式 | 遮罩後氣泡貢獻可由 0.14–0.32 % 逐格讀出；`mask:null` 時 `meanAbs` 不再變 NaN |
 
 ---
 
@@ -226,6 +228,27 @@ f006 停在**水面下 36 m、pitch +0.36 仰視**，前向錐內只有 5 株且
 用 `git stash` 做前後 A/B（`_poseBase` vs `_poseB`，@1280×720），6 個 critic pose
 **edgeAvg 5.4306 → 5.4443**、逐格 ±0.10、`scan.js` 六格 **0 blobs**、兩個 run `errors: []`。
 
+#### 第 8 輪（低 CP 項，最後一項）：氣泡逐格辨識度（P2 #8）
+
+量法：`?time=12` 鎖住時鐘，`shoot.js` 跑兩次（開氣泡／`hide=bub`）@1280×720，再 `diff.js --mask=0,0,300,52`
+（遮掉 HUD 的 FPS 數字）。逐格「因氣泡而改變 >3 LSB 的畫素比例」：
+
+| pose | 0 | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|---|
+| 改前 changed % | 0.15 | 0.30 | 0.20 | 0.25 | 0.14 | 0.32 |
+| **改後 changed %** | **0.51** | **1.02** | **0.63** | **0.80** | **0.46** | **1.02** |
+
+根因是尺寸不是數量：精靈半徑 0.05–0.29 m 在 15–25 m 距離只有 2–4 px，3000 株氣泡全畫面只剩 1.3–2.9 k 畫素。
+處置：`placeLife` 的 `a[o+4]` 由 `0.05 + 0.24·r²` 改成 `0.10 + 0.42·r²`（半徑 ×1.85 → 面積 ×3.4，實測 ×3.3），
+`moteFS` 的環形銳度對氣泡由 7.5 軟化到 5.2（`mix(7.5, 5.2, kind)`，海雪維持細線）免得放大後斷成粒子點。
+
+- 未洗成一片：`p99Abs ≤ 9`、maxAbs 131–234（未到 255，沒有爆白）；`scan.js` pose1/pose5 仍 **0 blobs**（無 NaN 黑卡）。
+- 裁切目視 `_view/bub1.jpg`（pose5  brightest 點 ±160 px、2×）：開氣泡那格可辨識環狀氣泡附在巨藻莖旁，關掉那格乾淨。
+- 成本：`_perf1200d`（1200p／20 s tour／`--perf`）wall avg 9.14、gpuMs avg 7.77／p99 12.4 —— 與第 7 輪的 9.33／7.89／12.2
+  同級（在噪音內），因為只多 0.5–1.0 % 畫素的相加混合。
+- 過程中一度誤判「氣泡一個像素都沒畫」，其實是 PowerShell 引號讓 `--eval __scene.hide(...)` 靜默拋錯
+  （見 §1 缺陷表最後兩列）。
+
 
 ### 2.2 效能（scripted fly-through，fenced = 每幀等 `onSubmittedWorkDone`）
 
@@ -233,6 +256,7 @@ f006 停在**水面下 36 m、pitch +0.36 仰視**，前向錐內只有 5 株且
 
 | run | size | 條件 | frames | avg | p50 | p99 | p999 | max | 0.1% low (fps) |
 |---|---|---|---|---|---|---|---|---|---|
+| `_perf1200d` | 1920×1200 | `--perf`（vsync，20 s tour，**第 8 輪最終狀態**：氣泡精靈放大 1.85×） | 2190 | 9.14 | 5.6 | 22.2 | 22.3 | 27.6 | 36.2 |
 | `_perf1200c` | 1920×1200 | `--perf`（vsync，20 s tour，**第 7 輪最終狀態**：延後爬升的 tour 路徑） | 2144 | 9.33 | 5.6 | 22.2 | 22.3 | 27.8 | 36.0 |
 | `_perf1200b` | 1920×1200 | `--perf`（vsync，20 s tour，第 5 輪狀態：葉緣鋸齒＋中肋＋舷帶） | 2362 | 8.47 | 5.6 | 22.1 | 22.3 | 22.4 | 44.6 |
 | `_perf1200` | 1920×1200 | `--perf`（vsync，30 s tour，minor (c) 之前） | 3744 | 8.01 | 5.6 | 22.1 | 22.3 | 27.7 | 36.1 |
@@ -244,7 +268,8 @@ f006 停在**水面下 36 m、pitch +0.36 仰視**，前向錐內只有 5 株且
 | `_perf5` | 1920×1080 | `--perf`（vsync 180 Hz） | 3041 | 7.90 | 5.6 | 22.3 | 27.8 | 33.4 | 29.9 |
 | `_perf4` | 1920×1200 | `--perf`（vsync） | 4096 | 6.82 | 5.6 | 16.8 | 16.9 | 22.2 | 45.0 |
 
-GPU 端（`gpuMs`，同一 submit 的 fence 往返）：**`_perf1200c`（最終狀態）avg 7.89 / p50 7.7 / p99 12.2 / max 21.8**；
+GPU 端（`gpuMs`，同一 submit 的 fence 往返）：**`_perf1200d`（最終狀態）avg 7.77 / p50 7.4 / p99 12.4 / max 26.1**；
+**`_perf1200c`（第 7 輪狀態）avg 7.89 / p50 7.7 / p99 12.2 / max 21.8**；
 **`_perf1200b`（第 5 輪狀態）avg 7.41 / p50 6.8 / p99 12.3 / max 16.8**；
 `_perf1200` avg 7.03 / p99 11.9 / max 18.3；`_perf1200n`（關 vsync）avg 7.65 / p99 12.2 / max 16.4；
 `_t_perf` avg 7.29 / p99 11.8 / max 15.4；`_rev10p` avg 7.47 / p99 19.2 / max 24.7；
@@ -274,9 +299,9 @@ juvenile 0.17→0.24，第 4 輪再加每株約 270 個氣囊頂點 ≈ +39% kel
 或支援 inside-passes 的 build 上才會出現。
 
 ### 2.3 體積
-`node tools/check.js` → **raw 138.0 KiB | minified 93.9 KiB | gzip 33.2 KiB**（單檔，無外部資源）。
+`node tools/check.js` → **raw 138.5 KiB | minified 94.1 KiB | gzip 33.3 KiB**（單檔，無外部資源，第 8 輪狀態）。
 計畫的預算線是 minified < 200 KiB；`tests/verify.js` 那條斷言查的是檔案實際大小（raw ≤ 200 KiB），
-目前 raw 138.0 KiB 已經比 minified 200 KiB 的線更嚴，兩個面向都過。
+目前 raw 138.5 KiB 已經比 minified 200 KiB 的線更嚴，兩個面向都過。
 
 ### 2.4 自動化測試（WP9，本輪新增）
 `npm test`（PowerShell 5.1 若被執行原則擋掉，改用 `npm.cmd test`）→ `tests/verify.js`，TAP 13，**17 項斷言**：
@@ -358,7 +383,7 @@ juvenile 0.17→0.24，第 4 輪再加每株約 270 個氣囊頂點 ≈ +39% kel
 | `band.js` | PNG 的 banding 檢查（不用瀏覽器）：每欄往下找 ≥2 LSB 的「台階」＋平坦塊色階使用率；`--selftest` 用合成梯度自證判別力 | `node tools\band.js _rev13p\pose1-look-up-surface.png` |
 | `edges.js` | 一次印多張圖的 edge/std/mean（改前後比較結構量） | `node tools\edges.js _b0\tour baseline_20s_1280x720` |
 | `tourprobe.js` | 不靠看圖找出 fly-through 哪一格為何沒結構：重現 `shoot.js` 的取樣時間，印每格相機位置與「前向錐內的巨藻數／最近距離／貼鏡莖」 | `node tools\tourprobe.js 20` |
-| `diff.js` | 兩張 PNG 逐像素差異：changed pct、maxAbs、bbox（搭配 `?time=` 與 `hide=` 隔离圖層） | `node tools\diff.js _v4\p3_a.png _v4\p3_b.png` |
+| `diff.js` | 兩張 PNG 逐像素差異：changed pct、maxAbs、bbox、changed2（>2 LSB）；`--mask=x,y,w,h` 遮掉 HUD（它的 FPS 數字每張都變）；搭配 `?time=<sec>` 與 URL `hide=` 隔离圖層 | `node tools\diff.js _bb2_on\pose5-deep-arch.png _bb2_off\pose5-deep-arch.png 3 --mask=0,0,300,52` |
 | `sheet.js` | 用瀏覽器把多張圖排成帶標籤的 contact sheet（JPG） | `node tools\sheet.js --out _view\g1.jpg --cols 3 --w 1080 _rev8\pose0*.png ...` |
 | `montage.js` | 純 Node 版 contact sheet（輸出 PNG，不啟動瀏覽器） | `node tools\montage.js _view\m.png --cols 3 --w 480 a.png b.png` |
 | `dbg.js` | 頁面內除错：依序執行 `--eval` / `--shot`，最後印 ERRORS/cam/stats | `node tools\dbg.js --param "hide=snow,bub" --eval "__scene.setPose(3)" --shot _shots\a.png` |
@@ -417,6 +442,8 @@ node tools\dbg.js --param "hide=kelp,props" --eval "__scene.setPose(0)" --shot _
      tour 12 格 edgeMin 3.0802 → **3.7060**、edgeAvg 5.5754 → **5.6673**（見 §2.1 第 7 輪）。
      驗收指令：`node tools\shoot.js --size 1280x720 --poses none --tour 20 --tour-frames 12 --out _tour2`
      ＋ `node tools\edges.js _tour2\tour`；要查是哪一段的問題用 `node tools\tourprobe.js 20`。
-   - per-pass 計時要不要正式定位成「submit-fence 量測」寫進報告（P1 #6）；氣泡逐格辨識度（P2 #8 剩餘）。
+   - per-pass 計時要不要正式定位成「submit-fence 量測」寫進報告（P1 #6）——**報告 `perf.md` §5 已這樣寫**。
+   - ~~氣泡逐格辨識度（P2 #8 剩餘）~~ **第 8 輪已做**：精靈半徑 ×1.85、環形對氣泡軟化，
+     逐格貢獻 0.14–0.32 % → **0.46–1.02 %**（見 §2.1 第 8 輪）。至此 §3 的清單全數結清。
 4. **接手必讀**：本檔 §5（做什麼）＋ §4（工具怎么用）＋ §1 缺陷表最後三列（WGSL 不支援巢狀三元運算子、
    `crop.js` 非整數寬度會解出黑 tile、`verify.js` 的 rAF 斷言要抗 GPU 搶佔）；改 shader 後一定看 `shoot.js` 的 `errors`。

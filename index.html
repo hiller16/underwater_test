@@ -889,7 +889,9 @@ fn wrapBox(p : vec3<f32>, cam : vec3<f32>, size : vec3<f32>) -> vec3<f32> {
   let core = exp(-r * r * 3.4);
   // (not pow): the base goes negative inside the ring, and pow() with a negative base
   // is undefined in WGSL - it poisoned these sprites with NaN, which tonemaps to black.
-  let dr = (r - 0.80) * 7.5; let rim = exp(-dr * dr);
+  // The ring stays a hairline for snow motes, but a bubble is now big enough that the
+  // same width aliases into broken dots; softening it a little keeps the sphere read.
+  let dr = (r - 0.80) * mix(7.5, 5.2, i.kind); let rim = exp(-dr * dr);
   let dg = (r - 0.36) * 5.0; let glass = exp(-dg * dg) * 0.35;
   let shape = mix(core, (rim * 0.85 + glass * 0.6) * (1.0 - core * 0.55), i.kind);
   var col = mix(vec3<f32>(0.62, 0.88, 0.86), vec3<f32>(0.80, 0.97, 1.00), i.dat.w);
@@ -1890,7 +1892,10 @@ function placeLife(rng) {
     const v = vents[(r() * vents.length) | 0];
     a[o] = v[0] + (r() - 0.5) * 9; a[o + 1] = r() * 50; a[o + 2] = v[2] + (r() - 0.5) * 9;
     a[o + 3] = r();
-    a[o + 4] = 0.05 + 0.24 * r() * r(); a[o + 5] = 0.22 + 0.62 * r();
+    // Sprite radius in metres. At the old 0.05-0.29 a bubble was 2-4 px across at the
+    // typical 15-25 m range, so the whole stream measured 0.14-0.32 % of the frame and
+    // read as dust; these sizes put a stream clearly on screen without more instances.
+    a[o + 4] = 0.10 + 0.42 * r() * r(); a[o + 5] = 0.22 + 0.62 * r();
     a[o + 6] = 0.5 + 1.8 * r(); a[o + 7] = r();
     a[o + 8] = 1; a[o + 9] = 90; a[o + 10] = 0; a[o + 11] = 0;
   });

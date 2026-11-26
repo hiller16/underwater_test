@@ -26,9 +26,8 @@
 
 ## 3. 版本控制
 
-- 這個資料夾是 git repo。每完成一個可運作的改動、或通過一次驗證，就 commit 一次：`git add -A; git commit -m "<做了什麼>；<驗證結果>"`（PowerShell 5.1 用 `;` 串，不能用 `&&`）。
+- 這個資料夾是 git repo。commit、push 與建立 GitHub repo 照全域規則「git 與 GitHub」（push 只在使用者要求時做）。
 - `_` 開頭的驗證輸出資料夾和 `node_modules` 已經在 `.gitignore`，不要 commit。
-- 沒有遠端，不要 push；不要改寫歷史（`reset --hard`、`rebase`、`commit --amend` 都不用）。要退回某一版用 `git checkout <commit> -- <檔案>`。
 
 ## 4. 交接
 
