@@ -1,4 +1,4 @@
-# Kelp Cathedral — 單檔 WebGPU 海底場景
+# Kelp Cathedral — 單檔 WebGPU 海底場景 (地端模型測試)
 
 ![六個 critic 視點總覽（1920×1080 擷取）](docs/preview.jpg)
 
